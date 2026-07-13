@@ -1,0 +1,18 @@
+# Environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Pipeline outputs (regenerable; provenance lives in the config snapshots)
+results/
+
+# Trained checkpoints and auto-downloaded SAM weights
+models/
+
+# Input data (large)
+data/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

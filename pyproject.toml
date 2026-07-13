@@ -1,0 +1,69 @@
+[project]
+name = "drift"
+version = "1.0.0"
+description = "DRIFT: Detection and Re-Identification of Icebergs as Flow Tracers -- multi-object tracking, georeferencing, and fjord circulation analysis from glacier time-lapse imagery"
+readme = "README.md"
+authors = [{ name = "Marco Jaeger-Kufel" }]
+requires-python = ">=3.11,<3.14"  # 3.13 pinned in .python-version
+
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.1",
+    "omegaconf>=2.3",
+    "tqdm>=4.66",
+    "matplotlib>=3.8",
+    "pillow>=10.0",
+    "opencv-python-headless>=4.10",  # headless: no libGL needed on HPC
+    "torch>=2.5,<2.8",
+    "torchvision>=0.20,<0.23",
+    "timm>=1.0",
+    "pytorch-metric-learning>=2.5",
+    "scikit-learn>=1.4",
+    "filterpy>=1.4.5",
+    "glimpse",  # pinned to a known working commit, see [tool.uv.sources]
+]
+
+[dependency-groups]
+sam = [  # SAM backends for extract-outlines (method=sam)
+    "mobile-sam",
+    "segment-anything>=1.0",
+]
+basemap = ["contextily>=1.6"]  # OSM basemaps in the figures
+dev = ["ruff>=0.6"]
+
+[tool.uv]
+package = false  # application: run in place, never installed
+default-groups = ["dev", "sam", "basemap"]
+
+[tool.uv.sources]
+glimpse = { git = "https://github.com/ezwelty/glimpse", rev = "ae4d5c55a98737f2288d373ba024e9c663adf928" }
+mobile-sam = { git = "https://github.com/ChaoningZhang/MobileSAM", rev = "f706ad9c4eb7f219c00d9050e46328518ffb65d2" }
+# CUDA 12.6 builds on Linux: the default (cu13.0) wheels dropped Volta
+# kernels, and the cluster V100s are compute capability 7.0.
+torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+# Glimpse's declared deps (GDAL==3.2.0, sharedmem, lmfit, piexif) no longer
+# install; they never execute in our code paths and helpers.get_glimpse()
+# stubs them at import time. This override keeps only what glimpse needs.
+[[tool.uv.dependency-metadata]]
+name = "glimpse"
+version = "0.1.1"
+requires-dist = [
+    "numpy>=1.18",
+    "scipy>=1.4",
+    "matplotlib>=3.2",
+    "progress>=1.5",
+    "typing-extensions>=3.7",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src"]

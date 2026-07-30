@@ -10,9 +10,9 @@ glacier fjords.
 
 <table>
   <tr>
-    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/detections.jpg" width="260" alt="Detected icebergs with bounding boxes"></td>
-    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracking.gif" width="260" alt="Tracked icebergs with outlines and persistent IDs"></td>
-    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_pixel.png" width="260" alt="Trajectories in image space coloured by drift speed"></td>
+    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/detections.jpg" height="170" alt="Detected icebergs with bounding boxes"></td>
+    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracking.gif" height="170" alt="Tracked icebergs with outlines and persistent IDs"></td>
+    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_pixel.png" height="170" alt="Trajectories in image space coloured by drift speed"></td>
   </tr>
   <tr>
     <td align="center"><b>Detection</b></td>
@@ -20,9 +20,9 @@ glacier fjords.
     <td align="center"><b>Trajectories in image space</b></td>
   </tr>
   <tr>
-    <td align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_map.png" width="260" alt="UTM trajectories coloured by drift speed"></td>
-    <td align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/circulation_vectors.png" width="260" alt="Gridded velocity vectors"></td>
-    <td align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/circulation_streamlines.png" width="260" alt="Circulation streamlines"></td>
+    <td align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_map.png" height="170" alt="UTM trajectories coloured by drift speed"></td>
+    <td align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/circulation_vectors.png" height="170" alt="Gridded velocity vectors"></td>
+    <td align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/circulation_streamlines.png" height="170" alt="Circulation streamlines"></td>
   </tr>
   <tr>
     <td align="center"><b>Georeferenced Trajectories</b></td>

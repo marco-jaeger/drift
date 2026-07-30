@@ -8,12 +8,28 @@ detects and tracks icebergs from time-lapse imagery and turns their
 trajectories into velocity fields to reveal circulation patterns within
 glacier fjords.
 
-|                                                                                                                                                      |                                                                                                                                                             |                                                                                                                                                                   |
-|:----------------------------------------------------------------------------------------------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------:|
-|  <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/detections.jpg" width="290" alt="Detected icebergs with bounding boxes">   | <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracking.gif" width="290" alt="Tracked icebergs with outlines and persistent IDs"> | <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_pixel.png" width="290" alt="Trajectories in image space coloured by drift speed"> |
-|                                                                    **Detection**                                                                     |                                                                  **Tracking and outlines**                                                                  |                                                                 **Trajectories in image space**                                                                   |
-| <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_map.png" width="290" alt="UTM trajectories coloured by drift speed"> |        <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/circulation_vectors.png" width="290" alt="Gridded velocity vectors">        |         <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/circulation_streamlines.png" width="290" alt="Circulation streamlines">          |
-|                                                            **Georeferenced Trajectories**                                                            |                                                                     **Velocity field**                                                                      |                                                                    **Circulation Streamlines**                                                                    |
+<table>
+  <tr>
+    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/detections.jpg" width="260" alt="Detected icebergs with bounding boxes"></td>
+    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracking.gif" width="260" alt="Tracked icebergs with outlines and persistent IDs"></td>
+    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_pixel.png" width="260" alt="Trajectories in image space coloured by drift speed"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Detection</b></td>
+    <td align="center"><b>Tracking and outlines</b></td>
+    <td align="center"><b>Trajectories in image space</b></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_map.png" width="260" alt="UTM trajectories coloured by drift speed"></td>
+    <td align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/circulation_vectors.png" width="260" alt="Gridded velocity vectors"></td>
+    <td align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/circulation_streamlines.png" width="260" alt="Circulation streamlines"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Georeferenced Trajectories</b></td>
+    <td align="center"><b>Velocity field</b></td>
+    <td align="center"><b>Circulation Streamlines</b></td>
+  </tr>
+</table>
 
 
 

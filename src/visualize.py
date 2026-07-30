@@ -623,7 +623,7 @@ def plot_tracks_pixel(tracks, image_path, out_path, linewidth=1.0, alpha=0.8):
 
 def plot_track_map_velocity(tracks_utm, out_path, frame_interval_min=2.0,
                             cmap="plasma", basemap=True, utm_epsg=UTM_EPSG,
-                            linewidth=1.8, vmin=None, vmax=None,
+                            linewidth=1.0, vmin=None, vmax=None,
                             colorbar=True, scalebar_length_m=1000.0,
                             scalebar_label="1 km", dpi=300):
     """UTM trajectory map with each segment coloured by drift speed."""
@@ -667,7 +667,7 @@ def plot_track_map_velocity(tracks_utm, out_path, frame_interval_min=2.0,
 
 def plot_tracks_pixel_velocity(tracks, tracks_utm, image_path, out_path,
                                frame_interval_min=2.0, cmap="plasma",
-                               linewidth=2.0, image_fade=0.5,
+                               linewidth=1.0, image_fade=0.5,
                                image_fade_to="white", image_saturation=0.0,
                                vmin=None, vmax=None, colorbar=True, dpi=300):
     """Image-space trajectories coloured by the GEOREFERENCED drift speed.

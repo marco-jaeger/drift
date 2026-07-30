@@ -10,7 +10,7 @@ Commands:
     embed             Generate embeddings for detections or ground truth
     track             Run multi-object tracking
     eval              Evaluate tracking against ground truth
-    visualize         Render annotated images and a video
+    visualize         Render annotated images, a video and/or a GIF
     extract-outlines  Segment tracked detections into outline polygons
     georeference      Project tracks to UTM and assemble trajectories
     circulation       Aggregate trajectories into circulation fields

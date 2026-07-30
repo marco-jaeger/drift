@@ -1,11 +1,25 @@
-# DRIFT
+# DRIFT: **D**etection and **R**e-**I**dentification of Icebergs as **F**low **T**racers
 
-Detection and Re-Identification of Icebergs as Flow Tracers: multi-object
-tracking of icebergs in glacier time-lapse imagery, with georeferencing and
-fjord circulation analysis. Detection (Faster R-CNN), appearance embeddings
-(DINOv2 + metric learning), Kalman-assisted tracking, MOT evaluation,
-outline extraction (SAM/Otsu), pixel-to-UTM projection (glimpse), and gridded
-velocity/streamline fields.
+[![Python](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.7-red.svg)](https://pytorch.org/)
+
+This repository an automated multi-object tracking framework that detects and
+tracks icebergs from time-lapse imagery and turns their trajectories
+into velocity fields to reveal circulation patterns within glacier fjords.
+
+---
+
+## Key Features
+- Hybrid association of appearance and motion to track hundreds to thousands icebergs per frame, across varying conditions
+- Iceberg outlines from SAM, giving per-iceberg sizes and waterline-based
+  tracer points
+- Camera projection turning pixel tracks into georeferenced trajectories in UTM coordinates, drift velocities and streamline
+  fields, optionally split by iceberg size or time window
+- Start right away with the pretrained detection and embedding models, or
+  train from scratch on your own annotated data
+- Built-in visualization at every stage: annotated frames, videos, and GIFs
+
+---
 
 ## Installation
 
@@ -13,7 +27,7 @@ Make sure [uv](https://docs.astral.sh/uv/) is installed on your system.
 
 ```bash
 git clone https://github.com/marco-jaeger/drift.git
-cd iceberg-tracking
+cd drift
 
 uv sync
 ```
@@ -32,7 +46,7 @@ uv run src/run.py <command> [key=value ...]
 | `embed`           | embedding.py     | Embeddings for detections or ground truth          |
 | `track`           | tracking.py      | Multi-object tracking                              |
 | `eval`            | evaluation.py    | CLEAR/Identity metrics vs ground truth             |
-| `visualize`       | visualize.py     | Annotated frames (boxes/IDs/outlines) and video    |
+| `visualize`       | visualize.py     | Annotated frames (boxes/IDs/outlines), video, GIF  |
 | `extract-outlines`| outlines.py      | Segment tracked detections (SAM or Otsu)           |
 | `georeference`    | georeference.py  | Project tracks to UTM, sizes, trajectory figures   |
 | `circulation`     | circulation.py   | Gridded velocity fields and streamline panels      |
@@ -50,3 +64,8 @@ uv run src/run.py georeference dataset=ekas-hill
 uv run src/run.py circulation dataset=ekas-hill size_split=p50
 uv run src/run.py visualize dataset=ekas-hill draw_outlines=true
 ```
+
+For a step-by-step walkthrough with more detailed explanations see [docs](docs/).
+
+
+**Happy tracking!**

@@ -1,10 +1,11 @@
-"""Visualization: annotated frames/videos and publication figures.
+"""Visualization: annotated frames/videos/GIFs and publication figures.
 
 Frame annotation (visualize command): draws IDs, boxes, and the stored
 outlines from extract-outlines onto the frames of any annotation source
-(ground_truth, detections, tracking, eval) and renders a video. Outlines are
-read from outlines.npz rather than re-segmented, so the figures show exactly
-the geometry the analysis used. Outputs under results/<seq>/visualization/.
+(ground_truth, detections, tracking, eval) and renders a video and/or an
+animated GIF. Outlines are read from outlines.npz rather than re-segmented,
+so the figures show exactly the geometry the analysis used. Outputs under
+results/<seq>/visualization/.
 
 Publication figures (called by the georeference and circulation commands):
 UTM/pixel trajectory maps (plain and drift-speed-coloured), the standalone
@@ -23,6 +24,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Rectangle
+from PIL import Image
 from tqdm import tqdm
 
 from helpers import (
@@ -56,6 +58,10 @@ class VisualizationConfig:
     seq_length_limit: Optional[int] = None
     show_images: bool = False
 
+    # Size of the images, video and GIF as a percentage of the source
+    # resolution; None = 100, lowered by make_gif (see Visualizer.GIF_QUALITY)
+    quality: Optional[int] = None
+
     # Annotation elements. Outlines/masks come from outlines.npz
     # (extract-outlines) and are keyed by track ID, so they are available for
     # the tracking and eval sources.
@@ -68,8 +74,9 @@ class VisualizationConfig:
     # Single colour for all icebergs as hex "#RRGGBB"; None = per-ID colours
     uniform_color: Optional[str] = None
 
-    # Video (rendered from the annotated images)
+    # Video and GIF, both compiled from the annotated images at fps
     make_video: bool = False
+    make_gif: bool = False
     fps: int = 7
 
 
@@ -89,29 +96,44 @@ def _parse_color(color):
 # ============================================================================
 
 class Visualizer:
-    """Annotates iceberg frames and renders videos for one dataset."""
+    """Annotates iceberg frames and renders videos/GIFs for one dataset."""
 
     VALID_SOURCES = ("ground_truth", "detections", "tracking", "eval")
     OUTLINE_SOURCES = ("tracking", "eval")  # outlines are keyed by track ID
     MASK_ALPHA = 0.5
+
+    # Default quality when make_gif is set: GIF is a palette format, and
+    # full-resolution frames run to gigabytes
+    GIF_QUALITY = 20
 
     def __init__(self, config: VisualizationConfig):
         self.config = config
         self.annotation_source = config.annotation_source
         self._uniform_color = _parse_color(config.uniform_color)
         self._colormap = {}  # Consistent per-ID colours across frames
+        self._annotated = {}  # sequence -> frames written, for video/GIF
 
         if self.annotation_source not in self.VALID_SOURCES:
             raise ValueError(
                 f"Invalid annotation source '{self.annotation_source}'. "
                 f"Must be one of: {', '.join(self.VALID_SOURCES)}")
+
+        quality = config.quality
+        if quality is None:
+            quality = self.GIF_QUALITY if config.make_gif else 100
+        if not 0 < quality <= 100:
+            raise ValueError(f"quality must be in (0, 100], got {quality}.")
+        self._scale = quality / 100
+
         log_config(config, title="Visualization Configuration")
 
     def run(self):
-        """Annotate all sequences and (optionally) render the videos."""
+        """Annotate all sequences and (optionally) render videos and GIFs."""
         self.annotate_icebergs()
         if self.config.make_video:
             self.render_video()
+        if self.config.make_gif:
+            self.render_gif()
 
     # ------------------------------------------------------------------ #
     # Annotation
@@ -121,6 +143,8 @@ class Visualizer:
         """Annotate the selected frames of every sequence."""
         sequences = get_sequences(self.config.dataset,
                                   run_name=self.config.run_name)
+        logger.info(f"Rendering frames at {self._scale:.0%} of the source "
+                    "resolution")
 
         for sequence_name, paths in sequences.items():
             log_section(f"Annotating sequence: {sequence_name}")
@@ -147,6 +171,7 @@ class Visualizer:
                 img = cv2.imread(str(image_path))
                 if img is None:
                     raise FileNotFoundError(f"Image not found: {image_path}")
+                img = self._scale_frame(img)
 
                 for iceberg_id, iceberg_data in icebergs.items():
                     progress.update(1)
@@ -159,6 +184,8 @@ class Visualizer:
                     self._draw_iceberg(img, iceberg_id, iceberg_data, outline)
 
                 cv2.imwrite(str(out_dir / f"{frame_name}.jpg"), img)
+                self._annotated.setdefault(sequence_name, []).append(
+                    f"{frame_name}.jpg")
                 if self.config.show_images:
                     plt.figure(figsize=(10, 6))
                     plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
@@ -172,13 +199,29 @@ class Visualizer:
                                f"stored outline")
             save_config_snapshot(self.config, out_dir / "config.yaml")
 
+    def _scale_frame(self, img):
+        """Resize a frame to the configured quality. Annotations are drawn
+        afterwards, at the matching scale."""
+        if self._scale == 1:
+            return img
+        size = (max(1, round(img.shape[1] * self._scale)),
+                max(1, round(img.shape[0] * self._scale)))
+        return cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+
     def _draw_iceberg(self, img, iceberg_id, iceberg_data, outline):
-        """Draw the configured annotation elements for one iceberg."""
+        """Draw the configured annotation elements for one iceberg.
+
+        Coordinates and line/font weights are scaled together, so a reduced
+        quality looks like the full-resolution figure shrunk -- the icebergs
+        keep their share of the frame instead of disappearing under labels.
+        Weights are floored so no stroke is lost entirely.
+        """
         color = self._get_object_color(iceberg_id)
-        x1, y1, w, h = iceberg_data["bbox"]
+        x1, y1, w, h = np.asarray(iceberg_data["bbox"], dtype=float) * self._scale
 
         if outline is not None:
-            pts = np.round(np.asarray(outline)).astype(np.int32).reshape(-1, 1, 2)
+            pts = np.round(np.asarray(outline, dtype=float) * self._scale
+                           ).astype(np.int32).reshape(-1, 1, 2)
             if self.config.draw_masks:
                 mask = np.zeros(img.shape[:2], dtype=np.uint8)
                 cv2.fillPoly(mask, [pts], 255)
@@ -188,16 +231,23 @@ class Visualizer:
                                ).astype(np.uint8)
             if self.config.draw_outlines:
                 cv2.polylines(img, [pts], isClosed=True, color=color,
-                              thickness=self.config.outline_thickness,
+                              thickness=self._scaled(
+                                  self.config.outline_thickness),
                               lineType=cv2.LINE_AA)
 
         if self.config.draw_boxes:
             cv2.rectangle(img, (int(x1), int(y1)),
-                          (int(x1 + w), int(y1 + h)), color, 3)
+                          (int(x1 + w), int(y1 + h)), color, self._scaled(3))
         if self.config.draw_ids:
-            text_y = max(int(y1) - 10, 20)
+            text_y = max(int(y1) - self._scaled(10), self._scaled(20))
             cv2.putText(img, str(iceberg_id), (int(x1), text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        max(0.3, 0.7 * self._scale),  # 0.3: cv2's legible floor
+                        color, self._scaled(2))
+
+    def _scaled(self, pixels, minimum=1):
+        """A pixel weight or offset at the output scale, never below 1 px."""
+        return max(minimum, round(pixels * self._scale))
 
     def _load_sequence_outlines(self, paths):
         """Load stored outlines when outline/mask drawing is enabled.
@@ -263,8 +313,8 @@ class Visualizer:
                 map(int, np.random.randint(0, 255, 3)))
         return self._colormap[object_id]
 
-    def _source_dirs(self, paths):
-        """(images_dir, videos_dir) inside the directory that owns the
+    def _source_dirs(self, paths, media="videos"):
+        """(images_dir, media_dir) inside the directory that owns the
         annotations being visualized; run_name scoping comes from the paths
         themselves. eval shares the tracking directory with the tracking
         source, so its frames go to images_eval/."""
@@ -275,11 +325,39 @@ class Visualizer:
             "eval": paths["tracking"].parent,
         }[self.annotation_source]
         images_name = "images_eval" if self.annotation_source == "eval" else "images"
-        return owner / images_name, owner / "videos"
+        return owner / images_name, owner / media
 
     # ------------------------------------------------------------------ #
-    # Video
+    # Video and GIF
     # ------------------------------------------------------------------ #
+
+    def _annotated_images(self, sequence_name, paths, media):
+        """(image_dir, media_dir, frame names) for one sequence, or None when
+        it has no annotated frames to compile.
+
+        Only the frames this run annotated are compiled. The directory can
+        also hold frames from earlier runs -- outside the configured frame
+        range, or at a different quality, which a video or GIF cannot mix.
+        Everything in it is used only when the render is called on its own,
+        without annotate_icebergs.
+        """
+        image_dir, out_dir = self._source_dirs(paths, media)
+        if not image_dir.exists():
+            logger.warning(f"No annotated images at {image_dir}, skipping")
+            return None
+
+        images = self._annotated.get(sequence_name)
+        on_disk = sorted(f.name for f in image_dir.iterdir()
+                         if f.name.lower().endswith("jpg"))
+        if images is None:
+            images = on_disk
+        elif len(on_disk) > len(images):
+            logger.warning(f"{image_dir} also holds {len(on_disk) - len(images)}"
+                           f" frame(s) from earlier runs; skipping those")
+        if not images:
+            logger.warning(f"No annotated images in {image_dir}, skipping")
+            return None
+        return image_dir, out_dir, images
 
     def render_video(self):
         """Compile the annotated images of every sequence into an MP4."""
@@ -290,15 +368,10 @@ class Visualizer:
         for sequence_name, paths in sequences.items():
             logger.info(f"\nProcessing sequence: {sequence_name}")
 
-            image_dir, video_dir = self._source_dirs(paths)
-            if not image_dir.exists():
-                logger.warning(f"No annotated images at {image_dir}, skipping")
+            selected = self._annotated_images(sequence_name, paths, "videos")
+            if selected is None:
                 continue
-            images = sorted(f.name for f in image_dir.iterdir()
-                            if f.name.lower().endswith("jpg"))
-            if not images:
-                logger.warning(f"No annotated images in {image_dir}, skipping")
-                continue
+            image_dir, video_dir, images = selected
 
             video_dir.mkdir(parents=True, exist_ok=True)
             video_path = video_dir / f"{self.annotation_source}.mp4"
@@ -347,6 +420,56 @@ class Visualizer:
             if failed_frames:
                 logger.warning(f"Failed to write {failed_frames} frames")
             logger.info(f"Video saved to: {video_path}")
+
+    def render_gif(self):
+        """Compile the annotated images of every sequence into an animated GIF.
+
+        The frames were already written at the configured quality, so the GIF
+        only adds palette reduction: each frame is opened one at a time and
+        becomes an 8-bit palette image (one byte per pixel instead of three),
+        and consecutive frames are stored as transparent deltas
+        (optimize=True), which is nearly free on the static parts of a
+        time-lapse. Pillow holds every frame until the file is written, so
+        quality is what keeps both the file and the peak memory small.
+        """
+        # 20 ms: below that most viewers substitute a default frame duration
+        duration_ms = max(20, round(1000.0 / self.config.fps))
+        logger.info(f"\nRendering GIFs at {self.config.fps} fps")
+        sequences = get_sequences(self.config.dataset,
+                                  run_name=self.config.run_name)
+
+        for sequence_name, paths in sequences.items():
+            logger.info(f"\nProcessing sequence: {sequence_name}")
+
+            selected = self._annotated_images(sequence_name, paths, "gifs")
+            if selected is None:
+                continue
+            image_dir, gif_dir, images = selected
+
+            gif_dir.mkdir(parents=True, exist_ok=True)
+            gif_path = gif_dir / f"{self.annotation_source}.gif"
+
+            with Image.open(image_dir / images[0]) as probe:
+                width, height = probe.size
+            logger.info(f"GIF: {width}x{height}, {len(images)} frames")
+
+            frames = (self._load_gif_frame(image_dir / name)
+                      for name in tqdm(images, desc="Writing GIF",
+                                       unit="frame"))
+            first = next(frames)
+            first.save(gif_path, save_all=True, append_images=frames,
+                       duration=duration_ms, loop=0, optimize=True)
+
+            size_mb = gif_path.stat().st_size / 1e6
+            logger.info(f"GIF saved to: {gif_path} ({size_mb:.1f} MB)")
+
+    @staticmethod
+    def _load_gif_frame(image_path):
+        """One annotated frame as an 8-bit palette image. 128 adaptive colours
+        are indistinguishable from GIF's maximum 256 on these scenes."""
+        with Image.open(image_path) as src:
+            img = src.convert("RGB")
+        return img.convert("P", palette=Image.Palette.ADAPTIVE, colors=128)
 
 
 # ============================================================================

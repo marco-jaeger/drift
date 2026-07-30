@@ -263,10 +263,10 @@ def compute_track_speeds(tracks_utm, frame_interval_min=2.0):
 
 def load_waterlines(paths, tracks, camera, z_sea_mean, vertical_threshold_deg):
     """Load outlines + quality for a sequence and compute waterline arrays."""
-    outlines = outlines.load_outlines(paths["outlines"])
+    berg_outlines = outlines.load_outlines(paths["outlines"])
     quality = outlines.load_outline_quality(paths["outlines"])
     return outlines.per_detection_waterlines(
-        tracks, camera, outlines, z_sea_mean=z_sea_mean,
+        tracks, camera, berg_outlines, z_sea_mean=z_sea_mean,
         vertical_threshold_deg=vertical_threshold_deg, quality=quality)
 
 

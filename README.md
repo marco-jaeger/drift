@@ -3,11 +3,19 @@
 [![Python](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.7-red.svg)](https://pytorch.org/)
 
-This repository an automated multi-object tracking framework that detects and
-tracks icebergs from time-lapse imagery and turns their trajectories
-into velocity fields to reveal circulation patterns within glacier fjords.
+This repository provides an automated multi-object tracking framework that
+detects and tracks icebergs from time-lapse imagery and turns their
+trajectories into velocity fields to reveal circulation patterns within
+glacier fjords.
 
----
+|                                                                                                                                                      |                                                                                                                                                             |                                                                                                                                                                   |
+|:----------------------------------------------------------------------------------------------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------:|
+|  <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/detections.jpg" width="290" alt="Detected icebergs with bounding boxes">   | <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracking.gif" width="290" alt="Tracked icebergs with outlines and persistent IDs"> | <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_pixel.png" width="290" alt="Trajectories in image space coloured by drift speed"> |
+|                                                                    **Detection**                                                                     |                                                                  **Tracking and outlines**                                                                  |                                                                 **Trajectories in image space**                                                                   |
+| <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_map.png" width="290" alt="UTM trajectories coloured by drift speed"> |        <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/circulation_vectors.png" width="290" alt="Gridded velocity vectors">        |         <img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/circulation_streamlines.png" width="290" alt="Circulation streamlines">          |
+|                                                            **Georeferenced Trajectories**                                                            |                                                                     **Velocity field**                                                                      |                                                                    **Circulation Streamlines**                                                                    |
+
+
 
 ## Key Features
 - Hybrid association of appearance and motion to track hundreds to thousands icebergs per frame, across varying conditions
@@ -19,7 +27,7 @@ into velocity fields to reveal circulation patterns within glacier fjords.
   train from scratch on your own annotated data
 - Built-in visualization at every stage: annotated frames, videos, and GIFs
 
----
+
 
 ## Installation
 

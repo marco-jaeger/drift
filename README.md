@@ -2,6 +2,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.7-red.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 This repository provides an automated multi-object tracking framework that
 detects and tracks icebergs from time-lapse imagery and turns their
@@ -91,5 +92,8 @@ uv run src/run.py visualize dataset=ekas-hill draw_outlines=true
 
 For a step-by-step walkthrough with more detailed explanations see [docs](docs/).
 
+## License
+
+DRIFT is released under the [MIT license](LICENSE).
 
 **Happy tracking!**

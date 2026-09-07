@@ -12,7 +12,7 @@ glacier fjords.
 <table>
   <tr>
     <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/detections.jpg" height="170" alt="Detected icebergs with bounding boxes"></td>
-    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracking.gif" height="170" alt="Tracked icebergs with outlines and persistent IDs"></td>
+    <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracking.gif" height="170" alt="Tracked icebergs with segmented outlines"></td>
     <td width="33%" align="center"><img src="https://github.com/marco-jaeger/drift/releases/download/v1.0.0/tracks_pixel.png" height="170" alt="Trajectories in image space coloured by drift speed"></td>
   </tr>
   <tr>
@@ -91,6 +91,10 @@ uv run src/run.py visualize dataset=ekas-hill draw_outlines=true
 ```
 
 For a step-by-step walkthrough with more detailed explanations see [docs](docs/).
+
+### 24h time-lapse video
+[![24h timelapse](https://github.com/marco-jaeger/drift/releases/download/v1.0.0/24h_timelapse_thumb.jpg)](https://github.com/marco-jaeger/drift/releases/download/v1.0.0/24h_timelapse.mp4)
+
 
 ## License
 

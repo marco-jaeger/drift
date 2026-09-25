@@ -730,6 +730,9 @@ class IcebergEmbeddingsTrainer:
         if not detections:
             logger.warning(f"No detections found in {detection_file}, skipping.")
             return
+        # MOT files are ID-major; frame-major order lets each worker's frame
+        # cache hit instead of re-decoding a full frame for nearly every crop.
+        detections.sort(key=lambda d: d["frame"])
 
         dataset = IcebergInferenceDataset(
             detections=detections,

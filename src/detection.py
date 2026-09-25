@@ -532,31 +532,23 @@ class IcebergDetector:
                 img_array = np.array(scaled_img)
                 h, w = img_array.shape[:2]
                 win_w, win_h = self.config.window_size
-                step_x = int(win_w * (1 - self.config.overlap))
-                step_y = int(win_h * (1 - self.config.overlap))
 
-                for y in range(0, h, step_y):
-                    if y + win_h > h:
-                        y = h - win_h  # Snap to edge
-                    for x in range(0, w, step_x):
-                        if x + win_w > w:
-                            x = w - win_w  # Snap to edge
+                for x, y in self._window_positions(w, h):
+                    window = img_array[y:y + win_h, x:x + win_w]
+                    window_tensor = self.transform(
+                        Image.fromarray(window)).unsqueeze(0).to(self.device)
+                    with torch.no_grad():
+                        predictions = self.model(window_tensor)
 
-                        window = img_array[y:y + win_h, x:x + win_w]
-                        window_tensor = self.transform(
-                            Image.fromarray(window)).unsqueeze(0).to(self.device)
-                        with torch.no_grad():
-                            predictions = self.model(window_tensor)
-
-                        boxes = predictions[0]["boxes"].cpu().numpy()
-                        scores = predictions[0]["scores"].cpu().numpy()
-                        if len(boxes) > 0:
-                            boxes[:, [0, 2]] = (boxes[:, [0, 2]] + x) / scale
-                            boxes[:, [1, 3]] = (boxes[:, [1, 3]] + y) / scale
-                            for box, score in zip(boxes, scores):
-                                if self._is_valid_detection(box, score, mask,
-                                                            img_width, img_height):
-                                    scale_detections.append({"box": box, "score": score})
+                    boxes = predictions[0]["boxes"].cpu().numpy()
+                    scores = predictions[0]["scores"].cpu().numpy()
+                    if len(boxes) > 0:
+                        boxes[:, [0, 2]] = (boxes[:, [0, 2]] + x) / scale
+                        boxes[:, [1, 3]] = (boxes[:, [1, 3]] + y) / scale
+                        for box, score in zip(boxes, scores):
+                            if self._is_valid_detection(box, score, mask,
+                                                        img_width, img_height):
+                                scale_detections.append({"box": box, "score": score})
             else:
                 img_tensor = self.transform(scaled_img).unsqueeze(0).to(self.device)
                 with torch.no_grad():
@@ -575,6 +567,20 @@ class IcebergDetector:
         merged = self._nms(scale_detections)
         merged = self._remove_nested_detections(merged)
         return self._convert_to_detection_format(merged)
+
+    def _window_positions(self, width, height):
+        """Top-left corners of the overlapping windows, row by row.
+
+        Windows running past the border are snapped back onto it, which can
+        land several on the same position; each position is kept once, since
+        a repeated window only yields boxes that NMS removes anyway.
+        """
+        win_w, win_h = self.config.window_size
+        step_x = int(win_w * (1 - self.config.overlap))
+        step_y = int(win_h * (1 - self.config.overlap))
+        ys = dict.fromkeys(min(y, height - win_h) for y in range(0, height, step_y))
+        xs = dict.fromkeys(min(x, width - win_w) for x in range(0, width, step_x))
+        return [(x, y) for y in ys for x in xs]
 
     def _nms(self, detections):
         """Greedy Non-Maximum Suppression on 'box'/'score' detections."""

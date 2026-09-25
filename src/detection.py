@@ -89,7 +89,8 @@ class IcebergDetectionConfig:
     # Embedding generation after detection
     generate_embeddings: bool = True
 
-    # Hardware (None = auto-detect)
+    # Hardware (None = CUDA if available, else CPU; MPS only when set
+    # explicitly, since Faster R-CNN on it trips macOS's GPU watchdog)
     device: Optional[str] = None
 
 
@@ -165,7 +166,7 @@ class IcebergDetector:
     def __init__(self, config: IcebergDetectionConfig):
         self.config = config
         self.dataset = config.dataset
-        self.device = resolve_device(config.device)
+        self.device = resolve_device(config.device, allow_mps=False)
         self.model = None
         self.transform = self._get_transforms()
 

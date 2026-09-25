@@ -181,14 +181,19 @@ def _git_commit():
         return None
 
 
-def resolve_device(device=None):
-    """Return the configured torch device, auto-detecting when None."""
+def resolve_device(device=None, allow_mps=True):
+    """Return the configured torch device, auto-detecting when None.
+
+    allow_mps=False skips Apple's GPU during auto-detection, for models whose
+    long GPU jobs trip macOS's display watchdog; an explicit device wins.
+    """
     import torch
     if device:
         return torch.device(device)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+    if (allow_mps and getattr(torch.backends, "mps", None)
+            and torch.backends.mps.is_available()):
         return torch.device("mps")
     return torch.device("cpu")
 

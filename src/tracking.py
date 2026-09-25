@@ -83,15 +83,23 @@ class IcebergTrackingConfig:
 
 def get_distance(iceberg_a, iceberg_b):
     """Euclidean distance in pixels between two iceberg bbox centers."""
-    return float(np.linalg.norm(
-        np.subtract(bbox_center(iceberg_a["bbox"]), bbox_center(iceberg_b["bbox"]))
-    ))
+    return center_distance(bbox_center(iceberg_a["bbox"]),
+                           bbox_center(iceberg_b["bbox"]))
+
+
+def center_distance(center_a, center_b):
+    """Euclidean distance in pixels between two (x, y) points."""
+    return float(np.linalg.norm(np.subtract(center_a, center_b)))
 
 
 def get_appearance_similarity(features_a, features_b, device="cpu"):
     """Cosine similarity of two embeddings, rescaled from [-1, 1] to [0, 1]."""
-    features_a = features_a.to(device).unsqueeze(0)
-    features_b = features_b.to(device).unsqueeze(0)
+    return rescaled_cosine(features_a.to(device).unsqueeze(0),
+                           features_b.to(device).unsqueeze(0))
+
+
+def rescaled_cosine(features_a, features_b):
+    """Cosine similarity of two [1, D] embeddings, rescaled to [0, 1]."""
     cosine_sim = F.cosine_similarity(features_a, features_b, dim=1)
     return ((cosine_sim + 1) / 2).item()
 
@@ -330,15 +338,16 @@ class SpatialIndex:
 
     def __init__(self, cell_size=100):
         self.cell_size = cell_size
-        self.index = defaultdict(list)  # (cell_x, cell_y) -> [(det_id, det_data)]
+        # (cell_x, cell_y) -> [(det_id, det_data, center)]
+        self.index = defaultdict(list)
 
     def build(self, detections):
         """Populate the index from a {det_id: det_data} dictionary."""
         self.index.clear()
         for det_id, det_data in detections.items():
-            center_x, center_y = bbox_center(det_data["bbox"])
-            cell = (int(center_x // self.cell_size), int(center_y // self.cell_size))
-            self.index[cell].append((det_id, det_data))
+            center = bbox_center(det_data["bbox"])
+            cell = (int(center[0] // self.cell_size), int(center[1] // self.cell_size))
+            self.index[cell].append((det_id, det_data, center))
 
     def query_radius(self, position, radius):
         """Return all (det_id, det_data) within `radius` of `position`."""
@@ -355,8 +364,7 @@ class SpatialIndex:
                 )
 
         filtered = []
-        for det_id, det_data in candidates:
-            det_x, det_y = bbox_center(det_data["bbox"])
+        for det_id, det_data, (det_x, det_y) in candidates:
             if np.hypot(det_x - x, det_y - y) <= radius:
                 filtered.append((det_id, det_data))
         return filtered
@@ -501,29 +509,29 @@ class IcebergTracker:
             for track in self.tracks if track.time_since_update == 0
         ]
 
-    def _compute_similarity(self, track, detection, features_a, features_b):
+    def _compute_similarity(self, track, last_center, predicted_center, track_features,
+                            detection, det_center, det_features):
         """Gated, weighted similarity for one track-detection pair.
 
         Size and appearance act as gates (with tolerance relaxation); pairs
         passing both gates get a weighted score over appearance, Euclidean
         distance, Kalman-predicted distance, and size. Returns None if gated out.
+        Centers and [1, D] embeddings come precomputed from _iter_candidates.
         """
-        last_iceberg = {"bbox": track.last_bbox}
-        detection_iceberg = {"bbox": detection["bbox"]}
         tolerance = 1 - self.config.threshold_tolerance
 
-        size_similarity = get_size_similarity(last_iceberg, detection_iceberg)
+        size_similarity = get_size_similarity({"bbox": track.last_bbox}, detection)
         if (self.config.use_size_threshold
                 and size_similarity < self.thresholds["size"] * tolerance):
             return None
 
-        appearance_similarity = get_appearance_similarity(features_a, features_b)
+        appearance_similarity = rescaled_cosine(track_features, det_features)
         if (self.config.use_appearance_threshold
                 and appearance_similarity < self.thresholds["appearance"] * tolerance):
             return None
 
-        distance_eucl = get_distance(last_iceberg, detection_iceberg)
-        distance_kalman = get_distance({"bbox": track.predicted_bbox}, detection_iceberg)
+        distance_eucl = center_distance(last_center, det_center)
+        distance_kalman = center_distance(predicted_center, det_center)
 
         dist_range = (self.thresholds["distance"]
                       if self.config.use_distance_threshold else float("inf"))
@@ -550,9 +558,18 @@ class IcebergTracker:
 
         Shared candidate generation for both matching algorithms: spatial
         query around each track's predicted position (adaptive radius when
-        Kalman is enabled), embedding lookup, and gated similarity.
+        Kalman is enabled), embedding lookup, and gated similarity. Each
+        detection's center and embedding are looked up once per frame rather
+        than once per track considering it.
         """
         all_detections = list(detections.values())
+        det_centers = {det_id: bbox_center(d["bbox"]) for det_id, d in detections.items()}
+        det_features = {}
+        for det_id in detections:
+            embedding = embeddings.get(emb_key(frame_id, det_id))
+            if embedding is not None:
+                det_features[det_id] = embedding.unsqueeze(0)
+
         if self.config.use_distance_threshold:
             base_radius = self.thresholds["distance"] * (1 + self.config.threshold_tolerance)
         else:
@@ -561,24 +578,27 @@ class IcebergTracker:
         for track in self.tracks:
             radius = (max(track.get_uncertainty(), base_radius)
                       if self.config.use_kalman else base_radius)
+            predicted_center = bbox_center(track.predicted_bbox)
 
             if spatial_index is None or radius == float("inf"):
                 candidates = [(d["id"], d) for d in all_detections]
             else:
-                candidates = spatial_index.query_radius(
-                    bbox_center(track.predicted_bbox), radius)
+                candidates = spatial_index.query_radius(predicted_center, radius)
 
             track_embedding = embeddings.get(
                 emb_key(track.history[-1][0], track.history[-1][1]))
             if track_embedding is None:
                 continue
+            track_features = track_embedding.unsqueeze(0)
+            last_center = bbox_center(track.last_bbox)
 
             for det_id, detection in candidates:
-                det_embedding = embeddings.get(emb_key(frame_id, det_id))
-                if det_embedding is None:
+                features = det_features.get(det_id)
+                if features is None:
                     continue
                 similarity = self._compute_similarity(
-                    track, detection, track_embedding, det_embedding)
+                    track, last_center, predicted_center, track_features,
+                    detection, det_centers[det_id], features)
                 if similarity is not None:
                     yield similarity, track, detection
 

@@ -1,8 +1,10 @@
 """Tracking evaluation against ground truth (MOTChallenge protocol).
 
 Two steps: (1) match_tracking_to_gt filters tracking results to GT-matched
-detections via frame-by-frame greedy IoU matching and writes eval.txt;
-(2) calc_metrics computes Count, CLEAR, and Identity metrics per sequence,
+detections via frame-by-frame greedy IoU matching and writes eval.txt, since
+the GT annotates only a subset of the icebergs and tracks of unannotated ones
+would otherwise all count as false positives (2) calc_metrics computes Count,
+CLEAR, and Identity metrics (Identity exactly as in TrackEval) per sequence,
 prints TrackEval-style tables, and writes metrics.json next to the tracking
 outputs for scriptable comparison across runs.
 """
@@ -12,7 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from collections import defaultdict
+from scipy.optimize import linear_sum_assignment
 
 from helpers import (
     calculate_iou, get_sequences, load_icebergs_by_frame, log_config,
@@ -136,8 +138,8 @@ def compute_sequence_metrics(gt_by_frame, track_by_frame, iou_threshold=0.5):
 
     Frame-by-frame greedy IoU matching (each GT matched to at most one track
     per frame and vice versa), followed by CLEAR statistics (recall, LocA,
-    IDSW, Frag, MT/PT/ML) and Identity metrics (IDF1/IDR/IDP via longest
-    continuous GT-track associations).
+    IDSW, Frag, MT/PT/ML) and Identity metrics (IDF1/IDR/IDP as in TrackEval:
+    a global one-to-one GT-track ID assignment, scored against all GT boxes).
     """
     frames = sorted(gt_by_frame.keys())
 
@@ -233,24 +235,11 @@ def compute_sequence_metrics(gt_by_frame, track_by_frame, iou_threshold=0.5):
     MLR = ML / GT_IDs if GT_IDs > 0 else 0.0
 
     # ---- 6. Identity metrics ---- #
-    gt_trajectories = defaultdict(list)
-    track_trajectories = defaultdict(list)
-    for frame_id in frames:
-        for gt_id, track_id in gt_to_track.get(frame_id, {}).items():
-            gt_trajectories[gt_id].append((frame_id, track_id))
-        for track_id, gt_id in track_to_gt.get(frame_id, {}).items():
-            track_trajectories[track_id].append((frame_id, gt_id))
+    IDTP, IDFN, IDFP = _identity_counts(gt_by_frame, track_by_frame, iou_threshold)
 
-    IDTP = sum(_longest_segment(traj) for traj in gt_trajectories.values())
-    IDTP_from_tracks = sum(_longest_segment(traj)
-                           for traj in track_trajectories.values())
-    IDFN = CLR_TP - IDTP
-    IDFP = CLR_TP - IDTP_from_tracks
-
-    IDR = IDTP / (IDTP + IDFN) if (IDTP + IDFN) > 0 else 0.0
-    IDP = IDTP / (IDTP + IDFP) if (IDTP + IDFP) > 0 else 0.0
-    IDF1 = (2 * IDTP / (2 * IDTP + IDFN + IDFP)
-            if (2 * IDTP + IDFN + IDFP) > 0 else 0.0)
+    IDR = IDTP / max(1.0, IDTP + IDFN)
+    IDP = IDTP / max(1.0, IDTP + IDFP)
+    IDF1 = IDTP / max(1.0, IDTP + 0.5 * IDFP + 0.5 * IDFN)
 
     return {
         # Count
@@ -265,30 +254,68 @@ def compute_sequence_metrics(gt_by_frame, track_by_frame, iou_threshold=0.5):
     }
 
 
-def _longest_segment(trajectory):
-    """Longest continuous run of the same partner ID in a (frame, id) list.
+def _identity_counts(gt_by_frame, track_by_frame, iou_threshold):
+    """IDTP, IDFN, IDFP as in TrackEval's Identity metric.
 
-    Used for IDTP: from the GT side the partner is a track ID, from the
-    track side it is a GT ID.
+    Every GT-track pair with IoU >= threshold in a frame is a potential match.
+    GT IDs and track IDs are then assigned one-to-one over the whole sequence
+    with each ID also free to stay unassigned. IDFN counts every GT box not
+    covered by its assigned track, including GT boxes no track matched at all;
+    IDFP counts every track box not on its assigned GT.
     """
-    segments = defaultdict(int)
-    current_partner = None
-    current_length = 0
+    gt_ids = sorted({i for gts in gt_by_frame.values() for i in gts})
+    track_ids = sorted({i for tracks in track_by_frame.values() for i in tracks})
+    num_gt, num_tr = len(gt_ids), len(track_ids)
+    gt_count = sum(len(gts) for gts in gt_by_frame.values())
+    track_count = sum(len(tracks) for tracks in track_by_frame.values())
+    if track_count == 0:
+        return 0, gt_count, 0
+    if gt_count == 0:
+        return 0, 0, track_count
 
-    for _, partner in trajectory:
-        if partner == current_partner:
-            current_length += 1
-        else:
-            if current_partner is not None:
-                segments[current_partner] = max(segments[current_partner],
-                                                current_length)
-            current_partner = partner
-            current_length = 1
+    gt_idx = {gt_id: k for k, gt_id in enumerate(gt_ids)}
+    tr_idx = {track_id: k for k, track_id in enumerate(track_ids)}
+    potential_matches = np.zeros((num_gt, num_tr))
+    gt_id_count = np.zeros(num_gt)
+    tracker_id_count = np.zeros(num_tr)
 
-    if current_partner is not None:
-        segments[current_partner] = max(segments[current_partner], current_length)
+    for frame_id in set(gt_by_frame) | set(track_by_frame):
+        gts = gt_by_frame.get(frame_id, {})
+        tracks = track_by_frame.get(frame_id, {})
+        for gt_id in gts:
+            gt_id_count[gt_idx[gt_id]] += 1
+        for track_id in tracks:
+            tracker_id_count[tr_idx[track_id]] += 1
+        for gt_id, gt in gts.items():
+            gx, gy, gw, gh = gt["bbox"]
+            for track_id, track in tracks.items():
+                tx, ty, tw, th = track["bbox"]
+                iou = calculate_iou([gx, gy, gx + gw, gy + gh],
+                                    [tx, ty, tx + tw, ty + th])
+                if iou >= iou_threshold:
+                    potential_matches[gt_idx[gt_id], tr_idx[track_id]] += 1
 
-    return max(segments.values()) if segments else 0
+    # Cost matrices padded with one dummy column per GT and one dummy row per
+    # track, so that every ID can also remain unmatched
+    size = num_gt + num_tr
+    fp_mat = np.zeros((size, size))
+    fn_mat = np.zeros((size, size))
+    fp_mat[num_gt:, :num_tr] = 1e10
+    fn_mat[:num_gt, num_tr:] = 1e10
+    for g in range(num_gt):
+        fn_mat[g, :num_tr] = gt_id_count[g]
+        fn_mat[g, num_tr + g] = gt_id_count[g]
+    for t in range(num_tr):
+        fp_mat[:num_gt, t] = tracker_id_count[t]
+        fp_mat[t + num_gt, t] = tracker_id_count[t]
+    fn_mat[:num_gt, :num_tr] -= potential_matches
+    fp_mat[:num_gt, :num_tr] -= potential_matches
+
+    rows, cols = linear_sum_assignment(fn_mat + fp_mat)
+    IDFN = int(fn_mat[rows, cols].sum())
+    IDFP = int(fp_mat[rows, cols].sum())
+    IDTP = int(gt_id_count.sum()) - IDFN
+    return IDTP, IDFN, IDFP
 
 
 def combine_metrics(all_metrics):

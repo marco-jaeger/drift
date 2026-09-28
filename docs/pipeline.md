@@ -148,6 +148,12 @@ MOT metrics: CLEAR (recall, localisation, ID switches, fragmentations,
 track coverage) and Identity (IDF1/IDR/IDP). Results are printed as tables
 and written as `metrics.json`.
 
+The Identity metrics follow TrackEval: GT and track IDs are assigned
+one-to-one over the whole sequence, and IDF1 is scored against all GT boxes.
+Because the ground truth annotates only a subset of the icebergs, tracks are
+first reduced to those that overlap a GT box (IoU above the threshold), so
+that correct tracks of unannotated icebergs do not count as false positives.
+
 ```bash
 uv run src/run.py eval dataset=ekas-hill
 ```

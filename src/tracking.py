@@ -10,7 +10,7 @@ Per-frame pipeline: predict -> index -> match -> update -> delete -> create.
 
 import logging
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, Optional
 
 import numpy as np
@@ -61,7 +61,8 @@ class IcebergTrackingConfig:
     get_gt_thresholds: bool = False   # Derive thresholds from GT statistics
     gt_thresholds: str = "ekas-hill-train"  # Dataset used for threshold derivation
 
-    # Feature weights
+    # Feature weights; 0 switches the component off entirely (appearance is
+    # not computed, the size gate and the Kalman filter are disabled)
     weight_appearance: float = 0.2
     weight_euclidean_distance: float = 0.2
     weight_kalman_distance: float = 0.5
@@ -73,8 +74,8 @@ class IcebergTrackingConfig:
     min_iceberg_size: float = 100.0  # Minimum bbox area for new tracks
 
     # Kalman filter
-    process_noise: float = 10.0
-    measurement_noise: float = 18.0
+    process_noise: float = 2.0
+    measurement_noise: float = 1.0
 
 
 # ============================================================================
@@ -378,7 +379,17 @@ class IcebergTracker:
     """Orchestrates tracking across all sequences of a dataset."""
 
     def __init__(self, config: IcebergTrackingConfig):
-        self.config = config
+        # A component with weight 0 is not used at all: no size gate, no
+        # Kalman filter, no appearance (the logged and saved config shows the
+        # switches as actually applied)
+        self.config = config = replace(
+            config,
+            use_kalman=config.use_kalman and config.weight_kalman_distance > 0,
+            use_size_threshold=config.use_size_threshold and config.weight_size > 0,
+            use_appearance_threshold=(config.use_appearance_threshold
+                                      and config.weight_appearance > 0),
+        )
+        self.use_appearance = config.weight_appearance > 0
         self.dataset = config.dataset
         self.sequences = get_sequences(self.dataset, run_name=config.run_name)
 
@@ -411,7 +422,7 @@ class IcebergTracker:
             if not paths["detections"].exists():
                 logger.warning(f"No det.txt found for {sequence_name}, skipping")
                 continue
-            if not paths["det_embeddings"].exists():
+            if self.use_appearance and not paths["det_embeddings"].exists():
                 logger.warning(f"No embeddings.pt found for {sequence_name}, skipping")
                 continue
 
@@ -421,9 +432,11 @@ class IcebergTracker:
             self.frame_count = 0
 
             icebergs_by_frame = load_icebergs_by_frame(paths["detections"])
-            logger.info(f"Loading embeddings from {paths['det_embeddings']}")
-            iceberg_embeddings = torch.load(paths["det_embeddings"])
-            logger.info(f"Loaded {len(iceberg_embeddings)} embeddings")
+            iceberg_embeddings = None
+            if self.use_appearance:
+                logger.info(f"Loading embeddings from {paths['det_embeddings']}")
+                iceberg_embeddings = torch.load(paths["det_embeddings"])
+                logger.info(f"Loaded {len(iceberg_embeddings)} embeddings")
 
             all_results = self._process_sequence(icebergs_by_frame, iceberg_embeddings)
             self._save_tracking_results(all_results, paths["tracking"])
@@ -525,10 +538,12 @@ class IcebergTracker:
                 and size_similarity < self.thresholds["size"] * tolerance):
             return None
 
-        appearance_similarity = rescaled_cosine(track_features, det_features)
-        if (self.config.use_appearance_threshold
-                and appearance_similarity < self.thresholds["appearance"] * tolerance):
-            return None
+        appearance_similarity = 0.0  # Weighted by 0 when appearance is off
+        if self.use_appearance:
+            appearance_similarity = rescaled_cosine(track_features, det_features)
+            if (self.config.use_appearance_threshold
+                    and appearance_similarity < self.thresholds["appearance"] * tolerance):
+                return None
 
         distance_eucl = center_distance(last_center, det_center)
         distance_kalman = center_distance(predicted_center, det_center)
@@ -560,15 +575,20 @@ class IcebergTracker:
         query around each track's predicted position (adaptive radius when
         Kalman is enabled), embedding lookup, and gated similarity. Each
         detection's center and embedding are looked up once per frame rather
-        than once per track considering it.
+        than once per track considering it. Without appearance no embedding is
+        read, so a missing one excludes nothing.
         """
         all_detections = list(detections.values())
         det_centers = {det_id: bbox_center(d["bbox"]) for det_id, d in detections.items()}
-        det_features = {}
-        for det_id in detections:
-            embedding = embeddings.get(emb_key(frame_id, det_id))
-            if embedding is not None:
-                det_features[det_id] = embedding.unsqueeze(0)
+        # Detections absent from det_features are skipped as candidates
+        if self.use_appearance:
+            det_features = {}
+            for det_id in detections:
+                embedding = embeddings.get(emb_key(frame_id, det_id))
+                if embedding is not None:
+                    det_features[det_id] = embedding.unsqueeze(0)
+        else:
+            det_features = dict.fromkeys(detections)
 
         if self.config.use_distance_threshold:
             base_radius = self.thresholds["distance"] * (1 + self.config.threshold_tolerance)
@@ -585,20 +605,21 @@ class IcebergTracker:
             else:
                 candidates = spatial_index.query_radius(predicted_center, radius)
 
-            track_embedding = embeddings.get(
-                emb_key(track.history[-1][0], track.history[-1][1]))
-            if track_embedding is None:
-                continue
-            track_features = track_embedding.unsqueeze(0)
+            track_features = None
+            if self.use_appearance:
+                track_embedding = embeddings.get(
+                    emb_key(track.history[-1][0], track.history[-1][1]))
+                if track_embedding is None:
+                    continue
+                track_features = track_embedding.unsqueeze(0)
             last_center = bbox_center(track.last_bbox)
 
             for det_id, detection in candidates:
-                features = det_features.get(det_id)
-                if features is None:
+                if det_id not in det_features:
                     continue
                 similarity = self._compute_similarity(
                     track, last_center, predicted_center, track_features,
-                    detection, det_centers[det_id], features)
+                    detection, det_centers[det_id], det_features[det_id])
                 if similarity is not None:
                     yield similarity, track, detection
 

@@ -1,27 +1,48 @@
-"""Tracking evaluation against ground truth (MOTChallenge protocol).
+"""Tracking evaluation against ground truth with the official TrackEval metrics.
 
-Two steps: (1) match_tracking_to_gt filters tracking results to GT-matched
-detections via frame-by-frame greedy IoU matching and writes eval.txt, since
-the GT annotates only a subset of the icebergs and tracks of unannotated ones
-would otherwise all count as false positives (2) calc_metrics computes Count,
-CLEAR, and Identity metrics (Identity exactly as in TrackEval) per sequence,
-prints TrackEval-style tables, and writes metrics.json next to the tracking
-outputs for scriptable comparison across runs.
+Two steps: (1) match_tracking_to_gt keeps, per frame, the tracking box assigned
+to each GT box (one-to-one Hungarian assignment on IoU) and writes eval.txt.
+The GT annotates only a subset of the icebergs, so boxes of unannotated
+icebergs are ignored instead of counted as false positives; a second box on
+the same annotated iceberg (e.g. split by shading) is ignored as well.
+(2) calc_metrics passes the full GT and eval.txt to TrackEval's HOTA, CLEAR,
+Identity, and Count metrics per sequence, combines sequences with TrackEval,
+prints the tables, and writes metrics.json next to the tracking outputs for
+scriptable comparison across runs.
 """
 
+import contextlib
+import io
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from helpers import (
-    calculate_iou, get_sequences, load_icebergs_by_frame, log_config,
-    log_section, save_metrics_json, write_mot_file,
+# TrackEval (pinned commit) still uses np.int/np.float/np.bool, which numpy
+# 1.24 removed; restore them as the builtins they were aliases of.
+for _name, _type in (("int", int), ("float", float), ("bool", bool)):
+    if not hasattr(np, _name):
+        setattr(np, _name, _type)
+
+# Importing trackeval prints a warning about its optional BURST dataset
+# (needs pycocotools), which is not used here.
+with contextlib.redirect_stdout(io.StringIO()):
+    from trackeval.datasets._base_dataset import _BaseDataset  # noqa: E402
+    from trackeval.metrics import CLEAR, HOTA, Count, Identity  # noqa: E402
+
+from helpers import (  # noqa: E402
+    get_sequences, load_icebergs_by_frame, log_config, log_section,
+    normalize_frame, save_metrics_json, write_mot_file,
 )
 
 logger = logging.getLogger(__name__)
+
+# Key under which compute_sequence_metrics keeps TrackEval's raw results,
+# needed by combine_metrics; not written to metrics.json
+RAW_KEY = "_trackeval"
 
 
 # ============================================================================
@@ -49,11 +70,10 @@ def eval_tracking(config: EvalConfig):
 
 
 def match_tracking_to_gt(config: EvalConfig):
-    """Filter tracking results to GT-matched detections and write eval.txt.
+    """Write eval.txt with the tracking boxes assigned to GT boxes.
 
-    For each GT object in each frame, the tracking detection with the highest
-    IoU above the threshold is kept; everything else is discarded. Unmatched
-    GT objects count as false negatives during metric computation.
+    See select_gt_matched_tracks. GT boxes without an assigned tracking box
+    count as false negatives during metric computation.
     """
     log_section("FILTER TRACKING RESULTS TO GROUND TRUTH")
     logger.info(f"Dataset: {config.dataset}")
@@ -65,38 +85,64 @@ def match_tracking_to_gt(config: EvalConfig):
     for sequence_name, paths in sequences.items():
         logger.info(f"Processing sequence: {sequence_name}")
 
-        gt_by_frame = load_icebergs_by_frame(paths["ground_truth"])
-        track_by_frame = load_icebergs_by_frame(paths["tracking"])
+        gt_by_frame = _load_unique_ids(paths["ground_truth"])
+        track_by_frame = _load_unique_ids(paths["tracking"])
+        selected = select_gt_matched_tracks(gt_by_frame, track_by_frame,
+                                            config.iou_threshold)
 
-        rows = []
-        for frame_id in sorted(gt_by_frame.keys()):
-            gts = gt_by_frame.get(frame_id, {})
-            tracks = track_by_frame.get(frame_id, {})
-            frame_matches = []
-
-            for gt in gts.values():
-                gt_bb = gt["bbox"]
-                best_match = 0.0
-                candidate = None
-
-                for track in tracks.values():
-                    track_bb = track["bbox"]
-                    box1 = [gt_bb[0], gt_bb[1], gt_bb[0] + gt_bb[2], gt_bb[1] + gt_bb[3]]
-                    box2 = [track_bb[0], track_bb[1],
-                            track_bb[0] + track_bb[2], track_bb[1] + track_bb[3]]
-                    iou = calculate_iou(box1, box2)
-                    if iou > best_match and iou > config.iou_threshold:
-                        best_match = iou
-                        candidate = track
-
-                if candidate is not None and candidate not in frame_matches:
-                    frame_matches.append(candidate)
-                    x, y, w, h = candidate["bbox"]
-                    rows.append((int(frame_id), candidate["id"],
-                                 x, y, w, h, candidate["conf"]))
-
+        rows = [(int(frame_id), track["id"], *track["bbox"], track["conf"])
+                for frame_id in sorted(selected)
+                for track in selected[frame_id].values()]
         write_mot_file(rows, paths["eval"])
         logger.info(f"Filtered tracking saved to: {paths['eval']}")
+
+
+def _load_unique_ids(path):
+    """load_icebergs_by_frame, after checking that no ID occurs twice in a frame.
+
+    load_icebergs_by_frame keys boxes by ID and would silently keep only the
+    last of two boxes with the same ID; TrackEval rejects such files.
+    """
+    counts = Counter()
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                frame, obj_id = line.split(",", 2)[:2]
+                counts[normalize_frame(frame), int(obj_id)] += 1
+    duplicates = sorted(key for key, n in counts.items() if n > 1)
+    if duplicates:
+        raise ValueError(f"{path}: same ID more than once in a frame, "
+                         f"(frame, id): {duplicates[:10]}")
+    return load_icebergs_by_frame(path)
+
+
+def select_gt_matched_tracks(gt_by_frame, track_by_frame, iou_threshold=0.5):
+    """Per frame, the tracking boxes assigned one-to-one to GT boxes.
+
+    GT and tracking boxes are assigned by maximising IoU (Hungarian), with
+    pairs below the IoU threshold excluded as in TrackEval's CLEAR matching,
+    so each GT box keeps the tracking box with the highest IoU unless another
+    GT box needs it. All other tracking boxes are ignored: boxes of icebergs
+    that are not annotated, and second boxes on an annotated iceberg.
+
+    Returns:
+        dict: {frame_id: {track_id: track}} for frames that contain GT boxes.
+    """
+    selected = {}
+    for frame_id, gts in gt_by_frame.items():
+        tracks = track_by_frame.get(frame_id, {})
+        selected[frame_id] = {}
+        if not gts or not tracks:
+            continue
+
+        track_ids = list(tracks)
+        ious = _box_ious(gts.values(), tracks.values())
+        ious[ious < iou_threshold - np.finfo("float").eps] = 0
+        rows, cols = linear_sum_assignment(-ious)
+        for r, c in zip(rows, cols):
+            if ious[r, c] > np.finfo("float").eps:
+                selected[frame_id][track_ids[c]] = tracks[track_ids[c]]
+    return selected
 
 
 def calc_metrics(config: EvalConfig):
@@ -114,13 +160,14 @@ def calc_metrics(config: EvalConfig):
     for sequence_name, paths in sequences.items():
         logger.info(f"Processing sequence: {sequence_name}")
 
-        gt_by_frame = load_icebergs_by_frame(paths["ground_truth"])
-        track_by_frame = load_icebergs_by_frame(paths["eval"])
+        gt_by_frame = _load_unique_ids(paths["ground_truth"])
+        track_by_frame = _load_unique_ids(paths["eval"])
 
         metrics = compute_sequence_metrics(gt_by_frame, track_by_frame,
                                            config.iou_threshold)
         all_metrics[sequence_name] = metrics
-        save_metrics_json(metrics, paths["metrics"])
+        save_metrics_json({k: v for k, v in metrics.items() if k != RAW_KEY},
+                          paths["metrics"])
 
     if len(all_metrics) > 1:
         all_metrics["COMBINED"] = combine_metrics(all_metrics)
@@ -130,278 +177,157 @@ def calc_metrics(config: EvalConfig):
 
 
 # ============================================================================
-# METRIC COMPUTATION
+# METRIC COMPUTATION (TrackEval)
 # ============================================================================
 
 def compute_sequence_metrics(gt_by_frame, track_by_frame, iou_threshold=0.5):
-    """Compute Count, CLEAR, and Identity metrics for one sequence.
+    """TrackEval HOTA, CLEAR, Identity, and Count metrics for one sequence.
 
-    Frame-by-frame greedy IoU matching (each GT matched to at most one track
-    per frame and vice versa), followed by CLEAR statistics (recall, LocA,
-    IDSW, Frag, MT/PT/ML) and Identity metrics (IDF1/IDR/IDP as in TrackEval:
-    a global one-to-one GT-track ID assignment, scored against all GT boxes).
+    Returns:
+        dict: TrackEval's summary fields (e.g. IDF1, IDSW, MOTA, HOTA), with
+        HOTA's fields averaged over its localisation thresholds as TrackEval
+        reports them, plus the raw results under RAW_KEY for combine_metrics.
     """
-    frames = sorted(gt_by_frame.keys())
-
-    # ---- 1. Frame-by-frame matching ---- #
-    gt_to_track = {}  # frame_id -> {gt_id: track_id}
-    track_to_gt = {}  # frame_id -> {track_id: gt_id}
-    CLR_TP = 0
-    CLR_FN = 0
-    all_ious = []
-
-    for frame_id in frames:
-        gts = gt_by_frame.get(frame_id, {})
-        tracks = track_by_frame.get(frame_id, {})
-        gt_to_track[frame_id] = {}
-        track_to_gt[frame_id] = {}
-
-        for gt_id, gt in gts.items():
-            gt_bb = gt["bbox"]
-            best_iou = 0.0
-            best_track_id = None
-
-            for track_id, track in tracks.items():
-                track_bb = track["bbox"]
-                box1 = [gt_bb[0], gt_bb[1], gt_bb[0] + gt_bb[2], gt_bb[1] + gt_bb[3]]
-                box2 = [track_bb[0], track_bb[1],
-                        track_bb[0] + track_bb[2], track_bb[1] + track_bb[3]]
-                iou = calculate_iou(box1, box2)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_track_id = track_id
-
-            if best_iou >= iou_threshold and best_track_id is not None:
-                gt_to_track[frame_id][gt_id] = best_track_id
-                track_to_gt[frame_id][best_track_id] = gt_id
-                all_ious.append(best_iou)
-                CLR_TP += 1
-            else:
-                CLR_FN += 1
-
-    # ---- 2. Count metrics ---- #
-    Dets = sum(len(tracks) for tracks in track_by_frame.values())
-    GT_Dets = sum(len(gts) for gts in gt_by_frame.values())
-
-    all_track_ids = set()
-    for tracks in track_by_frame.values():
-        all_track_ids.update(tracks.keys())
-    IDs = len(all_track_ids)
-
-    all_gt_ids = set()
-    for gts in gt_by_frame.values():
-        all_gt_ids.update(gts.keys())
-    GT_IDs = len(all_gt_ids)
-
-    # ---- 3. Recall and localization accuracy ---- #
-    CLR_Re = CLR_TP / GT_Dets if GT_Dets > 0 else 0.0
-    LocA = np.mean(all_ious) if len(all_ious) > 0 else 0.0
-
-    # ---- 4. ID switches and fragmentations ---- #
-    IDSW = 0
-    Frag = 0
-    gt_last_track = {}
-    gt_last_frame = {}
-
-    for frame_id in frames:
-        for gt_id, track_id in gt_to_track.get(frame_id, {}).items():
-            if gt_id in gt_last_track:
-                if gt_last_track[gt_id] != track_id:
-                    IDSW += 1
-                    gt_last_track[gt_id] = track_id
-                if int(frame_id) > int(gt_last_frame[gt_id]) + 1:
-                    Frag += 1  # Gap in tracking of this GT
-            else:
-                gt_last_track[gt_id] = track_id
-            gt_last_frame[gt_id] = int(frame_id)
-
-    # ---- 5. Track coverage (MT >= 80%, PT 20-80%, ML < 20%) ---- #
-    MT = PT = ML = 0
-    for gt_id in all_gt_ids:
-        gt_frames = [f for f in frames if gt_id in gt_by_frame.get(f, {})]
-        if not gt_frames:
-            continue
-        matched = sum(1 for f in gt_frames if gt_id in gt_to_track.get(f, {}))
-        coverage = matched / len(gt_frames)
-        if coverage >= 0.8:
-            MT += 1
-        elif coverage >= 0.2:
-            PT += 1
-        else:
-            ML += 1
-
-    MTR = MT / GT_IDs if GT_IDs > 0 else 0.0
-    PTR = PT / GT_IDs if GT_IDs > 0 else 0.0
-    MLR = ML / GT_IDs if GT_IDs > 0 else 0.0
-
-    # ---- 6. Identity metrics ---- #
-    IDTP, IDFN, IDFP = _identity_counts(gt_by_frame, track_by_frame, iou_threshold)
-
-    IDR = IDTP / max(1.0, IDTP + IDFN)
-    IDP = IDTP / max(1.0, IDTP + IDFP)
-    IDF1 = IDTP / max(1.0, IDTP + 0.5 * IDFP + 0.5 * IDFN)
-
-    return {
-        # Count
-        "Dets": Dets, "GT_Dets": GT_Dets, "IDs": IDs, "GT_IDs": GT_IDs,
-        # CLEAR
-        "CLR_Re": CLR_Re, "LocA": LocA, "CLR_TP": CLR_TP, "CLR_FN": CLR_FN,
-        "IDSW": IDSW, "Frag": Frag, "MT": MT, "PT": PT, "ML": ML,
-        "MTR": MTR, "PTR": PTR, "MLR": MLR,
-        # Identity
-        "IDF1": IDF1, "IDR": IDR, "IDP": IDP,
-        "IDTP": IDTP, "IDFN": IDFN, "IDFP": IDFP,
-    }
-
-
-def _identity_counts(gt_by_frame, track_by_frame, iou_threshold):
-    """IDTP, IDFN, IDFP as in TrackEval's Identity metric.
-
-    Every GT-track pair with IoU >= threshold in a frame is a potential match.
-    GT IDs and track IDs are then assigned one-to-one over the whole sequence
-    with each ID also free to stay unassigned. IDFN counts every GT box not
-    covered by its assigned track, including GT boxes no track matched at all;
-    IDFP counts every track box not on its assigned GT.
-    """
-    gt_ids = sorted({i for gts in gt_by_frame.values() for i in gts})
-    track_ids = sorted({i for tracks in track_by_frame.values() for i in tracks})
-    num_gt, num_tr = len(gt_ids), len(track_ids)
-    gt_count = sum(len(gts) for gts in gt_by_frame.values())
-    track_count = sum(len(tracks) for tracks in track_by_frame.values())
-    if track_count == 0:
-        return 0, gt_count, 0
-    if gt_count == 0:
-        return 0, 0, track_count
-
-    gt_idx = {gt_id: k for k, gt_id in enumerate(gt_ids)}
-    tr_idx = {track_id: k for k, track_id in enumerate(track_ids)}
-    potential_matches = np.zeros((num_gt, num_tr))
-    gt_id_count = np.zeros(num_gt)
-    tracker_id_count = np.zeros(num_tr)
-
-    for frame_id in set(gt_by_frame) | set(track_by_frame):
-        gts = gt_by_frame.get(frame_id, {})
-        tracks = track_by_frame.get(frame_id, {})
-        for gt_id in gts:
-            gt_id_count[gt_idx[gt_id]] += 1
-        for track_id in tracks:
-            tracker_id_count[tr_idx[track_id]] += 1
-        for gt_id, gt in gts.items():
-            gx, gy, gw, gh = gt["bbox"]
-            for track_id, track in tracks.items():
-                tx, ty, tw, th = track["bbox"]
-                iou = calculate_iou([gx, gy, gx + gw, gy + gh],
-                                    [tx, ty, tx + tw, ty + th])
-                if iou >= iou_threshold:
-                    potential_matches[gt_idx[gt_id], tr_idx[track_id]] += 1
-
-    # Cost matrices padded with one dummy column per GT and one dummy row per
-    # track, so that every ID can also remain unmatched
-    size = num_gt + num_tr
-    fp_mat = np.zeros((size, size))
-    fn_mat = np.zeros((size, size))
-    fp_mat[num_gt:, :num_tr] = 1e10
-    fn_mat[:num_gt, num_tr:] = 1e10
-    for g in range(num_gt):
-        fn_mat[g, :num_tr] = gt_id_count[g]
-        fn_mat[g, num_tr + g] = gt_id_count[g]
-    for t in range(num_tr):
-        fp_mat[:num_gt, t] = tracker_id_count[t]
-        fp_mat[t + num_gt, t] = tracker_id_count[t]
-    fn_mat[:num_gt, :num_tr] -= potential_matches
-    fp_mat[:num_gt, :num_tr] -= potential_matches
-
-    rows, cols = linear_sum_assignment(fn_mat + fp_mat)
-    IDFN = int(fn_mat[rows, cols].sum())
-    IDFP = int(fp_mat[rows, cols].sum())
-    IDTP = int(gt_id_count.sum()) - IDFN
-    return IDTP, IDFN, IDFP
+    data = _to_trackeval_data(gt_by_frame, track_by_frame)
+    raw = {metric.get_name(): metric.eval_sequence(data)
+           for metric in _metrics(iou_threshold)}
+    return _summarize(raw)
 
 
 def combine_metrics(all_metrics):
-    """Aggregate per-sequence metrics: sum counts, weight-average LocA,
-    recompute derived ratios from the summed counts."""
-    combined = {}
+    """Combine sequences (or datasets) with TrackEval's combine_sequences.
 
-    count_metrics = ["Dets", "GT_Dets", "IDs", "GT_IDs", "CLR_TP", "CLR_FN",
-                     "IDSW", "Frag", "MT", "PT", "ML", "IDTP", "IDFN", "IDFP"]
-    for metric in count_metrics:
-        combined[metric] = sum(m[metric] for m in all_metrics.values())
+    Takes {name: metrics} as returned by compute_sequence_metrics or by this
+    function. Combining combined results again is exact, as TrackEval
+    combines by sums and by averages weighted with summed counts.
+    """
+    raw = {}
+    for metric in _metrics():
+        name = metric.get_name()
+        raw[name] = metric.combine_sequences(
+            {seq: m[RAW_KEY][name] for seq, m in all_metrics.items()})
+    return _summarize(raw)
 
-    combined["CLR_Re"] = (combined["CLR_TP"] / combined["GT_Dets"]
-                          if combined["GT_Dets"] > 0 else 0.0)
-    combined["MTR"] = combined["MT"] / combined["GT_IDs"] if combined["GT_IDs"] > 0 else 0.0
-    combined["PTR"] = combined["PT"] / combined["GT_IDs"] if combined["GT_IDs"] > 0 else 0.0
-    combined["MLR"] = combined["ML"] / combined["GT_IDs"] if combined["GT_IDs"] > 0 else 0.0
 
-    total_matches = sum(m["CLR_TP"] for m in all_metrics.values())
-    if total_matches > 0:
-        combined["LocA"] = sum(m["LocA"] * m["CLR_TP"]
-                               for m in all_metrics.values()) / total_matches
-    else:
-        combined["LocA"] = 0.0
+def _metrics(iou_threshold=0.5):
+    """TrackEval metric objects; CLEAR and Identity match at iou_threshold.
 
-    combined["IDR"] = (combined["IDTP"] / (combined["IDTP"] + combined["IDFN"])
-                       if (combined["IDTP"] + combined["IDFN"]) > 0 else 0.0)
-    combined["IDP"] = (combined["IDTP"] / (combined["IDTP"] + combined["IDFP"])
-                       if (combined["IDTP"] + combined["IDFP"]) > 0 else 0.0)
-    combined["IDF1"] = (2 * combined["IDTP"]
-                        / (2 * combined["IDTP"] + combined["IDFN"] + combined["IDFP"])
-                        if (2 * combined["IDTP"] + combined["IDFN"] + combined["IDFP"]) > 0
-                        else 0.0)
-    return combined
+    HOTA evaluates its own range of IoU thresholds (0.05 to 0.95).
+    """
+    config = {"THRESHOLD": iou_threshold, "PRINT_CONFIG": False}
+    return [HOTA(), CLEAR(config), Identity(config), Count()]
 
+
+def _summarize(raw):
+    """Flat dict of TrackEval's summary fields, plus raw under RAW_KEY."""
+    summary = {}
+    for metric in _metrics():
+        res = raw[metric.get_name()]
+        integer_fields = set(getattr(metric, "integer_fields", []))
+        for field in metric.summary_fields:
+            value = res[field]
+            summary[field] = (int(value) if field in integer_fields
+                              else float(np.mean(value)))
+    summary[RAW_KEY] = raw
+    return summary
+
+
+def _to_trackeval_data(gt_by_frame, track_by_frame):
+    """One sequence in the form TrackEval's dataset classes pass to metrics.
+
+    IDs are renumbered to 0..N-1, every timestep gets an entry (also frames
+    without boxes, as CLEAR's IDSW and Frag depend on temporal adjacency),
+    and similarities are TrackEval's own box IoUs.
+    """
+    timesteps = _timesteps(gt_by_frame, track_by_frame)
+    gt_ids = sorted({i for gts in gt_by_frame.values() for i in gts})
+    track_ids = sorted({i for tracks in track_by_frame.values() for i in tracks})
+    gt_idx = {gt_id: k for k, gt_id in enumerate(gt_ids)}
+    track_idx = {track_id: k for k, track_id in enumerate(track_ids)}
+
+    data = {"num_timesteps": len(timesteps),
+            "num_gt_ids": len(gt_ids), "num_tracker_ids": len(track_ids),
+            "num_gt_dets": 0, "num_tracker_dets": 0,
+            "gt_ids": [], "tracker_ids": [], "similarity_scores": []}
+    for frame_id in timesteps:
+        gts = gt_by_frame.get(frame_id, {})
+        tracks = track_by_frame.get(frame_id, {})
+        data["gt_ids"].append(np.array([gt_idx[i] for i in gts], dtype=int))
+        data["tracker_ids"].append(
+            np.array([track_idx[i] for i in tracks], dtype=int))
+        data["similarity_scores"].append(_box_ious(gts.values(), tracks.values()))
+        data["num_gt_dets"] += len(gts)
+        data["num_tracker_dets"] += len(tracks)
+    return data
+
+
+def _timesteps(gt_by_frame, track_by_frame):
+    """All frame ids of a sequence in temporal order.
+
+    Numeric frame ids are filled in from the first to the last frame, so that
+    frames without any box remain timesteps; other ids (e.g. filenames) are
+    taken as they occur.
+    """
+    frames = set(gt_by_frame) | set(track_by_frame)
+    if not frames:
+        return []
+    try:
+        numbers = sorted(int(frame) for frame in frames)
+    except ValueError:
+        return sorted(frames)
+    return [normalize_frame(n) for n in range(numbers[0], numbers[-1] + 1)]
+
+
+def _box_ious(gt_boxes, track_boxes):
+    """IoU matrix (GT x tracking) of (x, y, w, h) boxes, computed by TrackEval."""
+    return _BaseDataset._calculate_box_ious(
+        np.array([b["bbox"] for b in gt_boxes], dtype=float).reshape(-1, 4),
+        np.array([b["bbox"] for b in track_boxes], dtype=float).reshape(-1, 4),
+        box_format="xywh")
+
+
+# ============================================================================
+# OUTPUT
+# ============================================================================
 
 def print_all_metrics(all_metrics):
-    """Print Count, CLEAR, Identity, and Derived tables in TrackEval style."""
+    """Print Count, CLEAR, Identity, HOTA, and derived tables."""
+    _log_table("Count", all_metrics, [], ["Dets", "GT_Dets", "IDs", "GT_IDs"])
+    _log_table("CLEAR", all_metrics,
+               ["MOTA", "MOTP", "CLR_Re", "CLR_Pr", "MTR", "PTR", "MLR"],
+               ["CLR_TP", "CLR_FN", "CLR_FP", "IDSW", "Frag", "MT", "PT", "ML"])
+    _log_table("Identity", all_metrics, ["IDF1", "IDR", "IDP"],
+               ["IDTP", "IDFN", "IDFP"])
+    _log_table("HOTA", all_metrics,
+               ["HOTA", "DetA", "AssA", "DetRe", "DetPr", "AssRe", "AssPr",
+                "LocA"], [])
 
-    logger.info(f"\n{'=' * 80}")
-    logger.info("Count:")
-    logger.info(f"{'=' * 80}")
-    logger.info(f"{'Sequence':<30} {'Dets':<12} {'GT_Dets':<12} {'IDs':<12} {'GT_IDs':<12}")
-    logger.info(f"{'-' * 80}")
-    for seq_name, m in all_metrics.items():
-        logger.info(f"{seq_name:<30} {m['Dets']:<12} {m['GT_Dets']:<12} "
-                    f"{m['IDs']:<12} {m['GT_IDs']:<12}")
-
-    logger.info(f"\n{'=' * 80}")
-    logger.info("CLEAR:")
-    logger.info(f"{'=' * 80}")
-    logger.info(
-        f"{'Sequence':<30} "
-        f"{'CLR_Re':<10} {'LocA':<10} {'MTR':<10} {'PTR':<10} {'MLR':<10} "
-        f"{'CLR_TP':<10} {'CLR_FN':<10} {'IDSW':<10} {'Frag':<10} "
-        f"{'MT':<8} {'PT':<8} {'ML':<8}")
-    logger.info(f"{'-' * 150}")
-    for seq_name, m in all_metrics.items():
-        logger.info(
-            f"{seq_name:<30} "
-            f"{m['CLR_Re']:<10.3f} {m['LocA']:<10.3f} {m['MTR']:<10.3f} "
-            f"{m['PTR']:<10.3f} {m['MLR']:<10.3f} "
-            f"{m['CLR_TP']:<10} {m['CLR_FN']:<10} {m['IDSW']:<10} {m['Frag']:<10} "
-            f"{m['MT']:<8} {m['PT']:<8} {m['ML']:<8}")
-
-    logger.info(f"\n{'=' * 80}")
-    logger.info("Identity:")
-    logger.info(f"{'=' * 80}")
-    logger.info(f"{'Sequence':<30} {'IDF1':<10} {'IDR':<10} {'IDP':<10} "
-                f"{'IDTP':<10} {'IDFN':<10} {'IDFP':<10}")
-    logger.info(f"{'-' * 100}")
-    for seq_name, m in all_metrics.items():
-        logger.info(f"{seq_name:<30} {m['IDF1']:<10.3f} {m['IDR']:<10.3f} "
-                    f"{m['IDP']:<10.3f} {m['IDTP']:<10} {m['IDFN']:<10} {m['IDFP']:<10}")
-
-    logger.info(f"\n{'=' * 80}")
+    width = 66
+    logger.info(f"\n{'=' * width}")
     logger.info("Derived Metrics:")
-    logger.info(f"{'=' * 80}")
-    logger.info(f"{'Sequence':<30} {'ID_Ratio':<12} {'IDSW/track':<12} {'Frag/track':<12}")
-    logger.info(f"{'-' * 80}")
+    logger.info(f"{'=' * width}")
+    logger.info(f"{'Sequence':<30}{'ID_Ratio':<12}{'IDSW/track':<12}{'Frag/track':<12}")
+    logger.info(f"{'-' * width}")
     for seq_name, m in all_metrics.items():
         gt_ids = m["GT_IDs"]
         id_ratio = m["IDs"] / gt_ids if gt_ids > 0 else 0.0
         idsw_per_track = m["IDSW"] / gt_ids if gt_ids > 0 else 0.0
         frag_per_track = m["Frag"] / gt_ids if gt_ids > 0 else 0.0
-        logger.info(f"{seq_name:<30} {id_ratio:<12.2f} "
-                    f"{idsw_per_track:<12.2f} {frag_per_track:<12.2f}")
+        logger.info(f"{seq_name:<30}{id_ratio:<12.2f}"
+                    f"{idsw_per_track:<12.2f}{frag_per_track:<12.2f}")
+    logger.info(f"\n{'=' * width}\n")
 
-    logger.info(f"\n{'=' * 80}\n")
+
+def _log_table(title, all_metrics, float_fields, int_fields):
+    """Log one metric table: a row per sequence, a column per field."""
+    width = 30 + 10 * (len(float_fields) + len(int_fields))
+    logger.info(f"\n{'=' * width}")
+    logger.info(f"{title}:")
+    logger.info(f"{'=' * width}")
+    logger.info(f"{'Sequence':<30}"
+                + "".join(f"{field:<10}" for field in float_fields + int_fields))
+    logger.info(f"{'-' * width}")
+    for seq_name, m in all_metrics.items():
+        logger.info(f"{seq_name:<30}"
+                    + "".join(f"{m[field]:<10.3f}" for field in float_fields)
+                    + "".join(f"{m[field]:<10}" for field in int_fields))

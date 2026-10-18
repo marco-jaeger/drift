@@ -22,6 +22,7 @@ dependencies = [
     "scikit-learn>=1.4",
     "filterpy>=1.4.5",
     "glimpse",  # pinned to a known working commit, see [tool.uv.sources]
+    "trackeval",  # official MOT metrics, pinned commit, see [tool.uv.sources]
 ]
 
 [dependency-groups]
@@ -39,6 +40,7 @@ default-groups = ["dev", "sam", "basemap"]
 [tool.uv.sources]
 glimpse = { git = "https://github.com/ezwelty/glimpse", rev = "ae4d5c55a98737f2288d373ba024e9c663adf928" }
 mobile-sam = { git = "https://github.com/ChaoningZhang/MobileSAM", rev = "f706ad9c4eb7f219c00d9050e46328518ffb65d2" }
+trackeval = { git = "https://github.com/JonathonLuiten/TrackEval", rev = "12c8791b303e0a0b50f753af204249e622d0281a" }
 # CUDA 12.6 builds on Linux: the default (cu13.0) wheels dropped Volta
 # kernels, and the cluster V100s are compute capability 7.0.
 torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]

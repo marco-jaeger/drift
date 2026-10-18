@@ -1,8 +1,9 @@
 """Iceberg detection with Faster R-CNN.
 
 Training: k-fold cross-validation over all sequences of the training dataset,
-keeping the best model by validation loss. One shared model (models/detection.pt)
-is used for all datasets.
+keeping the best model by validation loss, or (k_folds=0) a single run on all
+images for num_epochs without validation. One shared model
+(models/<model_name>.pt) is used for all datasets.
 
 Inference: multi-scale detection with sliding windows for large images, inline
 filtering (confidence, size, edge, mask), NMS, and nested-detection removal.
@@ -10,7 +11,9 @@ Optionally generates appearance embeddings for the detections inline.
 """
 
 import copy
+import json
 import logging
+import platform
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -41,6 +44,18 @@ from helpers import (
 logger = logging.getLogger(__name__)
 
 
+def hardware_info(device):
+    """GPU/CPU and library versions, for reporting runtimes."""
+    import torchvision
+    return {
+        "device": str(device),
+        "gpu": (torch.cuda.get_device_name(device)
+                if device.type == "cuda" else platform.processor() or None),
+        "torch": torch.__version__,
+        "torchvision": torchvision.__version__,
+    }
+
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -63,6 +78,7 @@ class IcebergDetectionConfig:
     # Training
     k_folds: int = 5
     num_epochs: int = 4
+    seed: int = 42
     batch_size: int = 2
     learning_rate: float = 0.005
     momentum: float = 0.9
@@ -88,6 +104,9 @@ class IcebergDetectionConfig:
 
     # Embedding generation after detection
     generate_embeddings: bool = True
+
+    # Model file: models/<model_name>.pt, written by training, read by detect
+    model_name: str = "detection"
 
     # Hardware (None = CUDA if available, else CPU; MPS only when set
     # explicitly, since Faster R-CNN on it trips macOS's GPU watchdog)
@@ -171,13 +190,13 @@ class IcebergDetector:
         self.transform = self._get_transforms()
 
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        self.model_file = MODELS_DIR / "detection.pt"
+        self.model_file = MODELS_DIR / f"{config.model_name}.pt"
         self.checkpoint_dir = MODELS_DIR / "checkpoints"
         if self.config.save_checkpoints:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         log_config(config, title="Iceberg Detection Configuration")
-        logger.info(f"Device: {self.device}")
+        logger.info(f"Device: {self.device} ({hardware_info(self.device)['gpu']})")
 
     # ------------------------------------------------------------------ #
     # Training
@@ -185,6 +204,8 @@ class IcebergDetector:
 
     def train(self):
         """Train with k-fold cross-validation; save the best model overall."""
+        if self.config.k_folds == 0:
+            return self._train_full()
         log_section("TRAINING PHASE")
         logger.info(f"{self.config.k_folds}-fold cross-validation, "
                     f"{self.config.num_epochs} epochs per fold")
@@ -246,11 +267,54 @@ class IcebergDetector:
 
         if best_model_state_overall:
             torch.save(best_model_state_overall, self.model_file)
-            save_config_snapshot(self.config, MODELS_DIR / "detection_config.yaml")
+            save_config_snapshot(
+                self.config, MODELS_DIR / f"{self.config.model_name}_config.yaml")
             logger.info(f"\nBest model saved to {self.model_file} "
                         f"(val loss {best_val_loss_overall:.4f})")
             logger.info(f"Training completed in "
                         f"{timedelta(seconds=int(time.time() - total_start_time))}")
+
+    def _train_full(self):
+        """Train on all images for num_epochs without validation and save the
+        final weights, plus a JSON record of hardware, data and timing."""
+        log_section("TRAINING PHASE (all images, no validation)")
+        cfg = self.config
+        torch.manual_seed(cfg.seed)
+        dataset = self._get_multi_seq_dataset()
+        loader = DataLoader(
+            dataset, batch_size=cfg.batch_size, shuffle=True,
+            num_workers=cfg.num_workers, collate_fn=lambda b: tuple(zip(*b)),
+            generator=torch.Generator().manual_seed(cfg.seed))
+        model = self._build_model()
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=cfg.learning_rate,
+            momentum=cfg.momentum, weight_decay=cfg.weight_decay)
+
+        losses, seconds = [], []
+        for epoch in range(cfg.num_epochs):
+            start = time.time()
+            losses.append(self._train_one_epoch(model, optimizer, loader))
+            seconds.append(time.time() - start)
+            logger.info(f"Epoch [{epoch + 1}/{cfg.num_epochs}] "
+                        f"Train Loss: {losses[-1]:.4f} ({seconds[-1]:.0f} s)")
+
+        torch.save(model.state_dict(), self.model_file)
+        save_config_snapshot(cfg, MODELS_DIR / f"{cfg.model_name}_config.yaml")
+        record = {
+            **hardware_info(self.device),
+            "model_transform": repr(model.transform),
+            "images": len(dataset),
+            "annotations": sum(len(d.detections) for d in dataset.datasets),
+            "epochs": cfg.num_epochs, "batch_size": cfg.batch_size,
+            "seed": cfg.seed,
+            "train_loss": [round(x, 5) for x in losses],
+            "epoch_seconds": [round(x, 1) for x in seconds],
+            "total_seconds": round(sum(seconds), 1),
+        }
+        (MODELS_DIR / f"{cfg.model_name}_train.json").write_text(
+            json.dumps(record, indent=1))
+        logger.info(f"Model saved to {self.model_file} "
+                    f"({timedelta(seconds=int(sum(seconds)))} training)")
 
     def _get_multi_seq_dataset(self):
         """Concatenate IcebergSequenceDatasets from all sequences with GT."""
@@ -400,6 +464,7 @@ class IcebergDetector:
             image_files = sorted(f.name for f in paths["images"].iterdir()
                                  if f.name.endswith(image_ext))
             all_detections = []
+            image_seconds = []
             start_time = time.time()
 
             logger.info(f"\nProcessing {len(image_files)} images in {sequence_name}")
@@ -407,8 +472,10 @@ class IcebergDetector:
                                 unit="image")
             for img_file in progress_bar:
                 img_name = img_file.rsplit(".", 1)[0]
+                img_start = time.time()
                 detections = self._run_multi_scale_sliding_window_prediction(
                     paths["images"] / img_file, mask, img_width, img_height)
+                image_seconds.append(time.time() - img_start)
                 for i, det in enumerate(detections):
                     det["image"] = img_name
                     det["object_id"] = i + 1
@@ -417,6 +484,7 @@ class IcebergDetector:
 
             self._save_detections(all_detections, paths["detections"])
             save_config_snapshot(self.config, paths["det_config"])
+            self._save_runtime(paths, image_files, image_seconds, len(all_detections))
             logger.info(f"{sequence_name}: {len(all_detections)} detections "
                         f"across {len(image_files)} images")
             logger.info(f"Saved to: {paths['detections']}")
@@ -430,13 +498,43 @@ class IcebergDetector:
                 IcebergEmbeddingsConfig(dataset=self.dataset))
             trainer.load_for_inference()
             for seq_name, paths in sequences.items():
+                start = time.time()
                 trainer.generate_embeddings(
                     image_dir=paths["images"],
                     detection_file=paths["detections"],
                     output_path=paths["det_embeddings"],
                 )
+                runtime_file = paths["detections"].parent / "runtime.json"
+                if runtime_file.exists():
+                    runtime = json.loads(runtime_file.read_text())
+                    runtime["embedding_seconds_per_image"] = round(
+                        (time.time() - start) / runtime["images"], 2)
+                    runtime_file.write_text(json.dumps(runtime, indent=1))
 
         log_section("Detection complete")
+
+    def _save_runtime(self, paths, image_files, image_seconds, n_detections):
+        """Write runtime.json next to det.txt: hardware, image size, forward
+        passes per image, and detection time per image (load to final boxes)."""
+        width, height = Image.open(paths["images"] / image_files[0]).size
+        passes = sum(
+            len(self._window_positions(int(width * s), int(height * s)))
+            if max(int(width * s), int(height * s)) > self.config.window_size[0]
+            else 1
+            for s in self.config.scales)
+        t = np.array(image_seconds)
+        runtime = {
+            **hardware_info(self.device),
+            "image_size": [width, height],
+            "forward_passes_per_image": passes,
+            "images": len(image_files),
+            "detections_per_image": round(n_detections / len(image_files), 1),
+            "seconds_per_image_mean": round(float(t.mean()), 2),
+            "seconds_per_image_min": round(float(t.min()), 2),
+            "seconds_per_image_max": round(float(t.max()), 2),
+        }
+        out = paths["detections"].parent / "runtime.json"
+        out.write_text(json.dumps(runtime, indent=1))
 
     def _load_filter(self):
         """Load the land mask and image dimensions if filtering is enabled.

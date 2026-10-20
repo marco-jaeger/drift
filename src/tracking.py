@@ -8,7 +8,10 @@ bidirectional (mutual best) or pure greedy assignment.
 Per-frame pipeline: predict -> index -> match -> update -> delete -> create.
 """
 
+import json
 import logging
+import platform
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Dict, Optional
@@ -63,9 +66,9 @@ class IcebergTrackingConfig:
 
     # Feature weights; 0 switches the component off entirely (appearance is
     # not computed, the size gate and the Kalman filter are disabled)
-    weight_appearance: float = 0.2
+    weight_appearance: float = 0.3
     weight_euclidean_distance: float = 0.2
-    weight_kalman_distance: float = 0.5
+    weight_kalman_distance: float = 0.4
     weight_size: float = 0.1
 
     # Track management
@@ -431,6 +434,7 @@ class IcebergTracker:
             self.next_track_id = 1
             self.frame_count = 0
 
+            load_start = time.perf_counter()
             icebergs_by_frame = load_icebergs_by_frame(paths["detections"])
             iceberg_embeddings = None
             if self.use_appearance:
@@ -438,11 +442,34 @@ class IcebergTracker:
                 iceberg_embeddings = torch.load(paths["det_embeddings"])
                 logger.info(f"Loaded {len(iceberg_embeddings)} embeddings")
 
+            track_start = time.perf_counter()
             all_results = self._process_sequence(icebergs_by_frame, iceberg_embeddings)
+            track_seconds = time.perf_counter() - track_start
             self._save_tracking_results(all_results, paths["tracking"])
             save_config_snapshot(self.config, paths["track_config"])
+            self._save_runtime(paths, icebergs_by_frame,
+                               track_start - load_start, track_seconds)
 
         log_section("Tracking complete")
+
+    def _save_runtime(self, paths, icebergs_by_frame, load_seconds, track_seconds):
+        """Write runtime.json next to track.txt: CPU, frames, and tracking time
+        (association of all frames; loading detections and embeddings separate)."""
+        n_frames = self.frame_count
+        n_detections = sum(len(d) for d in icebergs_by_frame.values())
+        runtime = {
+            "device": "cpu",
+            "cpu": platform.processor() or platform.machine(),
+            "frames": n_frames,
+            "detections_per_frame": round(
+                n_detections / max(len(icebergs_by_frame), 1), 1),
+            "tracks": self.next_track_id - 1,
+            "load_seconds": round(load_seconds, 2),
+            "tracking_seconds": round(track_seconds, 2),
+            "seconds_per_frame": round(track_seconds / max(n_frames, 1), 3),
+        }
+        out = paths["tracking"].parent / "runtime.json"
+        out.write_text(json.dumps(runtime, indent=1))
 
     def _process_sequence(self, icebergs_by_frame, embeddings):
         """Track all frames of one sequence with a progress bar."""

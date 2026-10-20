@@ -391,6 +391,11 @@ class IcebergTracker:
             use_size_threshold=config.use_size_threshold and config.weight_size > 0,
             use_appearance_threshold=(config.use_appearance_threshold
                                       and config.weight_appearance > 0),
+            # The spatial gate belongs to the distance terms: without
+            # Euclidean and Kalman distance every detection is a candidate
+            use_distance_threshold=(config.use_distance_threshold
+                                    and config.weight_euclidean_distance
+                                    + config.weight_kalman_distance > 0),
         )
         self.use_appearance = config.weight_appearance > 0
         self.dataset = config.dataset

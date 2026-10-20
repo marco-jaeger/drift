@@ -1,8 +1,8 @@
 """Iceberg detection with Faster R-CNN.
 
-Training: k-fold cross-validation over all sequences of the training dataset,
-keeping the best model by validation loss, or (k_folds=0) a single run on all
-images for num_epochs without validation. One shared model
+Training: by default (k_folds=0) a single run on all images of the training
+dataset for num_epochs without validation; with k_folds > 0, k-fold
+cross-validation keeping the best model by validation loss. One shared model
 (models/<model_name>.pt) is used for all datasets.
 
 Inference: multi-scale detection with sliding windows for large images, inline
@@ -32,11 +32,12 @@ from torchvision.models.detection import (
 )
 from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.ops import nms
 from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
 from helpers import (
-    DATA_DIR, MODELS_DIR, calculate_iou, get_image_ext, get_sequences,
+    DATA_DIR, MODELS_DIR, get_image_ext, get_sequences,
     log_config, log_section, resolve_device, save_config_snapshot,
     write_mot_file,
 )
@@ -76,9 +77,9 @@ class IcebergDetectionConfig:
         default_factory=lambda: [[0.4, 0.6, 0.8]] * 5)
 
     # Training
-    k_folds: int = 5
-    num_epochs: int = 4
-    seed: int = 42
+    k_folds: int = 0                  # 0 = single run on all images (paper model)
+    num_epochs: int = 2
+    seed: int = 67
     batch_size: int = 2
     learning_rate: float = 0.005
     momentum: float = 0.9
@@ -682,19 +683,21 @@ class IcebergDetector:
         return [(x, y) for y in ys for x in xs]
 
     def _nms(self, detections):
-        """Greedy Non-Maximum Suppression on 'box'/'score' detections."""
+        """Greedy Non-Maximum Suppression on 'box'/'score' detections.
+
+        torchvision's vectorized NMS (same greedy algorithm and IoU definition
+        as helpers.calculate_iou); float64 so that rounding does not move
+        pairs across the threshold. Returns the kept detections by
+        descending score.
+        """
         if not detections:
             return []
-        detections.sort(key=lambda x: x["score"], reverse=True)
-        keep = []
-        while detections:
-            best = detections.pop(0)
-            keep.append(best)
-            detections = [
-                det for det in detections
-                if calculate_iou(best["box"], det["box"]) < self.config.box_nms_thresh
-            ]
-        return keep
+        boxes = torch.as_tensor(np.stack([d["box"] for d in detections]),
+                                dtype=torch.float64)
+        scores = torch.as_tensor([float(d["score"]) for d in detections],
+                                 dtype=torch.float64)
+        keep = nms(boxes, scores, self.config.box_nms_thresh)
+        return [detections[i] for i in keep.tolist()]
 
     def _remove_nested_detections(self, detections):
         """Remove detections nested inside other detections.

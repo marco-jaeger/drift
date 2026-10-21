@@ -5,16 +5,21 @@ projection, identity-based PK-sampling, NT-Xent loss with Multi-Similarity
 mining, and square-context crops. Model selection uses Rank-1/Rank-5/mAP
 retrieval on held-out sequences, mirroring the downstream tracking task.
 
-One shared model (models/embedding.pt) is trained on the training dataset
-and used for embedding generation on all datasets. Exported format:
+One shared model (models/<model_name>.pt, default embedding.pt) is trained
+on the training dataset and used for embedding generation on all datasets;
+training also writes <model_name>_config.yaml and <model_name>_train.json
+(hardware, data size, epochs, and training time). Exported format:
 {f"{frame}_{id}": Tensor[feature_dim]} per sequence (see helpers.emb_key).
 
 Training schedule: Stage 1 trains the head with a frozen backbone; Stage 2
 unfreezes the last N transformer blocks with a lower backbone LR.
 """
 
+import json
 import logging
 import os
+import platform
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
@@ -53,6 +58,11 @@ class IcebergEmbeddingsConfig:
     # Data
     dataset: str = "???"
     val_dataset: Optional[str] = None  # Held-out sequences for retrieval eval
+    # Alternatively hold out this fraction of the icebergs (track IDs) of
+    # every training sequence: they are excluded from training and serve as
+    # Rank-1 queries (against all annotated icebergs of the next frame)
+    val_fraction: float = 0.0
+    val_seed: int = 42
     embed_source: str = "detections"   # 'detections' or 'ground_truth' (embed command)
 
     # Backbone (timm identifier; base/large DINOv2 variants are stronger but slower)
@@ -90,6 +100,9 @@ class IcebergEmbeddingsConfig:
     # Hardware (None = auto-detect)
     num_workers: int = 4
     device: Optional[str] = None
+
+    # Model file: models/<model_name>.pt (written by training, read by embed)
+    model_name: str = "embedding"
 
     @property
     def batch_size(self) -> int:
@@ -164,12 +177,15 @@ class IcebergIdentityDataset(Dataset):
         bbox_context: float = 0.15,
         transform: Optional[T.Compose] = None,
         min_samples_per_identity: int = 2,
+        exclude_ids: Optional[Dict[str, set]] = None,
     ):
         """
         Args:
             sequences: List of (gt_file, image_dir) tuples, typically built
                 from get_sequences() paths.
+            exclude_ids: {gt_file: track IDs} left out of training.
         """
+        exclude_ids = exclude_ids or {}
         self.target_size = target_size
         self.bbox_context = bbox_context
         self.image_ext = image_ext
@@ -188,10 +204,13 @@ class IcebergIdentityDataset(Dataset):
             icebergs_by_frame = load_icebergs_by_frame(gt_file)
             local_to_global: Dict[int, int] = {}
             n_crops_before = len(samples)
+            excluded = exclude_ids.get(gt_file, set())
 
             for frame_name, icebergs in icebergs_by_frame.items():
                 img_path = os.path.join(image_dir, f"{frame_name}.{image_ext}")
                 for local_id, data in icebergs.items():
+                    if local_id in excluded:
+                        continue
                     if local_id not in local_to_global:
                         local_to_global[local_id] = global_id
                         global_id += 1
@@ -399,7 +418,11 @@ class RetrievalEvaluator:
         sequences: List[Tuple[Any, Any]],
         config: IcebergEmbeddingsConfig,
         image_ext: str = "jpg",
+        query_ids: Optional[Dict[str, set]] = None,
     ):
+        """query_ids: {gt_file: track IDs}; if given, only these icebergs are
+        queries (all annotated icebergs of the next frame remain candidates)."""
+        self.query_ids = query_ids
         self.sequences = [(str(gt), str(img)) for gt, img in sequences]
         self.config = config
         self.image_ext = image_ext
@@ -437,7 +460,11 @@ class RetrievalEvaluator:
                 order = torch.argsort(sim, dim=1, descending=True)
                 id_to_pos_tp1 = {iid: pos for pos, iid in enumerate(ids_tp1)}
 
+                queries = (None if self.query_ids is None
+                           else self.query_ids.get(gt_file, set()))
                 for qi, query_id in enumerate(ids_t):
+                    if queries is not None and query_id not in queries:
+                        continue
                     if query_id not in id_to_pos_tp1:
                         continue  # No ground-truth match in frame t+1
                     rank = order[qi].tolist().index(id_to_pos_tp1[query_id])
@@ -480,14 +507,14 @@ class IcebergEmbeddingsTrainer:
     """Two-stage training orchestration plus embedding generation.
 
     Tracks validation Rank-1 (if val_dataset is set) and keeps the best
-    checkpoint at models/embedding.pt; without validation, the latest
+    checkpoint at models/<model_name>.pt; without validation, the latest
     checkpoint is saved each epoch.
     """
 
     def __init__(self, config: IcebergEmbeddingsConfig):
         self.config = config
         self.device = resolve_device(config.device)
-        self.model_path = MODELS_DIR / "embedding.pt"
+        self.model_path = MODELS_DIR / f"{config.model_name}.pt"
         # Resolved lazily: get_image_ext needs a real image directory
         self.image_ext: Optional[str] = None
 
@@ -520,6 +547,12 @@ class IcebergEmbeddingsTrainer:
         self.image_ext = get_image_ext(train_pairs[0][1])
         logger.info(f"Image extension: {self.image_ext}")
 
+        held_out = {}
+        if self.config.val_fraction > 0:
+            if self.config.val_dataset is not None:
+                raise ValueError("Set either val_dataset or val_fraction")
+            held_out = self._split_identities(train_pairs)
+
         logger.info(f"Training sequences ({len(train_pairs)}):")
         self.train_dataset = IcebergIdentityDataset(
             sequences=train_pairs,
@@ -528,9 +561,14 @@ class IcebergEmbeddingsTrainer:
             bbox_context=self.config.bbox_context,
             transform=_default_train_transform(),
             min_samples_per_identity=self.config.min_samples_per_identity,
+            exclude_ids=held_out,
         )
 
-        if self.config.val_dataset is not None:
+        if held_out:
+            self.evaluator = RetrievalEvaluator(
+                sequences=train_pairs, config=self.config,
+                image_ext=self.image_ext, query_ids=held_out)
+        elif self.config.val_dataset is not None:
             val_sequences = get_sequences(self.config.val_dataset)
             val_pairs = [(paths["ground_truth"], paths["images"])
                          for paths in val_sequences.values()]
@@ -538,6 +576,24 @@ class IcebergEmbeddingsTrainer:
                         f"{', '.join(val_sequences.keys())}")
             self.evaluator = RetrievalEvaluator(
                 sequences=val_pairs, config=self.config, image_ext=self.image_ext)
+
+    def _split_identities(self, train_pairs) -> Dict[str, set]:
+        """Hold out val_fraction of the track IDs of every sequence (seeded)
+        and save the split next to the model."""
+        rng = np.random.default_rng(self.config.val_seed)
+        held_out = {}
+        for gt_file, _ in train_pairs:
+            ids = sorted({i for icebergs in load_icebergs_by_frame(gt_file).values()
+                          for i in icebergs})
+            n = max(1, round(self.config.val_fraction * len(ids)))
+            held_out[str(gt_file)] = set(rng.choice(ids, n, replace=False).tolist())
+        split_file = MODELS_DIR / f"{self.config.model_name}_val_split.json"
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        split_file.write_text(json.dumps(
+            {k: sorted(v) for k, v in held_out.items()}, indent=1))
+        logger.info(f"Held out {sum(map(len, held_out.values()))} icebergs "
+                    f"({self.config.val_fraction:.0%} per sequence) -> {split_file}")
+        return held_out
 
     def _build_dataloader(self) -> None:
         assert self.train_dataset is not None
@@ -644,6 +700,7 @@ class IcebergEmbeddingsTrainer:
         assert self.model is not None
 
         best_rank1 = 0.0
+        start = time.time()
 
         if self.config.stage1_epochs > 0:
             log_section("STAGE 1: head warmup (backbone frozen)")
@@ -673,9 +730,42 @@ class IcebergEmbeddingsTrainer:
                 "stage2", self.config.stage2_epochs, optimizer,
                 early_stop=True, best_metric=best_rank1)
 
+        train_seconds = time.time() - start
         results = self._final_evaluation()
-        save_config_snapshot(self.config, MODELS_DIR / "embedding_config.yaml")
+        name = self.config.model_name
+        save_config_snapshot(self.config, MODELS_DIR / f"{name}_config.yaml")
+        self._save_train_info(train_seconds, results,
+                              MODELS_DIR / f"{name}_train.json")
         return results
+
+    def _save_train_info(self, seconds, results, out_file) -> None:
+        """Hardware, training data size, epochs run, and training time."""
+        import torchvision
+
+        boundaries = self.history["stage_boundaries"]
+        n_epochs = len(self.history["train_losses"])
+        stage1 = boundaries[0] if boundaries else 0
+        info = {
+            "device": str(self.device),
+            "gpu": (torch.cuda.get_device_name(self.device)
+                    if self.device.type == "cuda" else platform.processor() or None),
+            "torch": torch.__version__, "torchvision": torchvision.__version__,
+            "dataset": self.config.dataset, "val_dataset": self.config.val_dataset,
+            "crops": len(self.train_dataset.labels),
+            "identities": len(set(self.train_dataset.labels)),
+            "epochs_stage1": stage1, "epochs_stage2": n_epochs - stage1,
+            "final_train_loss": (round(self.history["train_losses"][-1], 4)
+                                 if n_epochs else None),
+            "val_fraction": self.config.val_fraction,
+            "train_loss_per_epoch": [round(v, 4) for v in self.history["train_losses"]],
+            "val_rank1_per_epoch": [round(v, 4) for v in self.history["val_rank1"]],
+            "total_seconds": round(seconds, 1),
+            "seconds_per_epoch": round(seconds / max(n_epochs, 1), 1),
+            **({k: round(float(v), 4) for k, v in results.items()
+                if k in ("rank1", "rank5", "mAP")}),
+        }
+        out_file.write_text(json.dumps(info, indent=1))
+        logger.info(f"Training info -> {out_file}")
 
     # ------------------------------------------------------------------ #
     # Evaluation, plotting, and embedding generation

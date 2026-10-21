@@ -51,9 +51,11 @@ class IcebergTrackingConfig:
     use_spatial_index: bool = True
     bidirectional_matching: bool = True  # False = pure greedy
 
-    # Thresholds (minimum appearance/size similarity, maximum distance in px)
+    # Thresholds (minimum appearance/size similarity, maximum distance in px),
+    # derived with get_gt_thresholds from the ekas-hill-train ground truth;
+    # appearance on the [0, 1] scale of the current embedding model
     thresholds: Dict[str, float] = field(default_factory=lambda: {
-        "appearance": 0.8102,
+        "appearance": 0.7453,
         "distance": 99.18,
         "size": 0.3143,
     })

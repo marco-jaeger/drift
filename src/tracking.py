@@ -68,9 +68,9 @@ class IcebergTrackingConfig:
 
     # Feature weights; 0 switches the component off entirely (appearance is
     # not computed, the size gate and the Kalman filter are disabled)
-    weight_appearance: float = 0.3
+    weight_appearance: float = 0.4
     weight_euclidean_distance: float = 0.2
-    weight_kalman_distance: float = 0.4
+    weight_kalman_distance: float = 0.3
     weight_size: float = 0.1
 
     # Track management
@@ -79,8 +79,8 @@ class IcebergTrackingConfig:
     min_iceberg_size: float = 100.0  # Minimum bbox area for new tracks
 
     # Kalman filter
-    process_noise: float = 2.0
-    measurement_noise: float = 1.0
+    process_noise: float = 6.0
+    measurement_noise: float = 10.0
 
 
 # ============================================================================

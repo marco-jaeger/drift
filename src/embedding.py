@@ -61,7 +61,7 @@ class IcebergEmbeddingsConfig:
     # Alternatively hold out this fraction of the icebergs (track IDs) of
     # every training sequence: they are excluded from training and serve as
     # Rank-1 queries (against all annotated icebergs of the next frame)
-    val_fraction: float = 0.0
+    val_fraction: float = 0.2
     val_seed: int = 42
     embed_source: str = "detections"   # 'detections' or 'ground_truth' (embed command)
 

@@ -3,6 +3,7 @@
 [![Python](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.7-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23809054.svg)](https://doi.org/10.5281/zenodo.23809054)
 
 This repository provides an automated multi-object tracking framework that
 detects and tracks icebergs from time-lapse imagery and turns their
@@ -55,6 +56,20 @@ git clone https://github.com/marco-jaeger/drift.git
 cd drift
 
 uv sync
+```
+
+## Data and Models
+
+The time-lapse images, annotations, trained detection and embedding models,
+and the detections and tracks of all sequences used in the paper are available
+on Zenodo: [doi.org/10.5281/zenodo.23809054](https://doi.org/10.5281/zenodo.23809054).
+The archives unpack into the `data/`, `models/`, and `results/` folders of this
+repository, so the pipeline runs on them without changes:
+
+```bash
+for f in ekas-hill-train ekas-hill ekas-fjord eqip-sermia models detections_tracks embeddings; do
+  unzip "$f.zip"
+done
 ```
 
 ## Pipeline

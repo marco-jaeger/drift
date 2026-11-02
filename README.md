@@ -86,7 +86,7 @@ uv run src/run.py detect dataset=ekas-hill
 uv run src/run.py track dataset=ekas-hill
 uv run src/run.py extract-outlines dataset=ekas-hill
 uv run src/run.py georeference dataset=ekas-hill
-uv run src/run.py circulation dataset=ekas-hill size_split=p50
+uv run src/run.py circulation dataset=ekas-hill
 uv run src/run.py visualize dataset=ekas-hill draw_outlines=true
 ```
 

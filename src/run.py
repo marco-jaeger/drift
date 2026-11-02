@@ -26,7 +26,7 @@ the (optional) YAML config, e.g.:
     python src/run.py visualize dataset=ekas-hill annotation_source=tracking
     python src/run.py extract-outlines dataset=ekas-hill method=sam
     python src/run.py georeference dataset=ekas-hill
-    python src/run.py circulation dataset=ekas-hill size_split=p50
+    python src/run.py circulation dataset=ekas-hill
 """
 
 from helpers import load_config, parse_cli_args, setup_logging

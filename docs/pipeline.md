@@ -206,17 +206,21 @@ Input: `camera.json` + `tracking/track.txt` + `tracking/outlines.npz` ->  Output
 ## 7. Fjord circulation
 
 `circulation` aggregates the georeferenced trajectories into a gridded
-velocity field: per-segment velocities (displacement over elapsed time) are
-interpolated onto a regular UTM grid, smoothed, and rendered as vector and
-streamline panels. With `size_split` (e.g. `p50` or `12m`) the field can be
-computed separately for small and large icebergs, using the per-iceberg
-median width.
+velocity field. Each velocity sample is the displacement of one iceberg
+between two consecutive frames. The samples are aggregated by their median
+per 100-m grid cell, cells with fewer than 10 samples are left empty, and the
+field is smoothed with a Gaussian filter (sigma = 1.5 cells) and rendered as
+vector and streamline panels. By default, the field is computed separately for
+smaller and larger icebergs, split at the 75th percentile of the per-iceberg
+median waterline widths (`size_split=p75`, icebergs with at least 25 trusted
+widths). `size_split=null` gives one combined field, and `tide_file=tide.csv`
+corrects the sea-surface height for the tide (CSV in `data/<dataset>/`).
 
 Input: `camera.json` + `tracking/track.txt` + `tracking/outlines.npz` (+ `iceberg_sizes.csv`) ->  Output: `circulation/*`.
 
 
 ```bash
-uv run src/run.py circulation dataset=ekas-hill size_split=p50
+uv run src/run.py circulation dataset=ekas-hill
 ```
 
 <table>

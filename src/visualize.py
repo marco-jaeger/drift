@@ -476,7 +476,8 @@ class Visualizer:
 # PUBLICATION STYLE AND MAP ELEMENTS
 # ============================================================================
 
-SPEED_LABEL = r"Drift speed (m min$^{-1}$)"
+SPEED_LABEL = "Speed (m/s)"
+M_PER_MIN_TO_M_PER_S = 1.0 / 60.0  # georeference speeds are in m/min
 AXIS_LABEL_SIZE = 22  # Publication-scale label size
 
 
@@ -517,12 +518,23 @@ def add_basemap(ax, utm_epsg=UTM_EPSG, alpha=0.7, zoom=None,
     """OpenStreetMap basemap with consistent attribution styling; tile or
     network failures are downgraded to a warning."""
     import contextily as ctx
-    kwargs = dict(crs=utm_epsg, source=ctx.providers.OpenStreetMap.Mapnik,
-                  alpha=alpha, attribution_size=attribution_size)
+    provider = ctx.providers.OpenStreetMap.Mapnik
+    # The OSM tile servers block requests without an identifying User-Agent,
+    # which includes contextily's default one (tile usage policy).
+    kwargs = dict(crs=utm_epsg, source=provider, alpha=alpha,
+                  attribution=False,
+                  headers={"user-agent": "DRIFT-figures/1.0 "
+                           "(+https://github.com/marco-jaeger/drift)"})
     if zoom is not None:
         kwargs["zoom"] = zoom
     try:
         ctx.add_basemap(ax, **kwargs)
+        # Own attribution in the lower left, 4.5 pt in print as in the
+        # circulation figures
+        k = _print_scale(ax.figure, ax)[0]
+        ax.text(0.008, 0.005, provider.get("attribution", "").replace("(C)", "\u00a9"),
+                transform=ax.transAxes, fontsize=4.5 * k, ha="left",
+                va="bottom", color="0.15", zorder=160)
     except Exception as exc:
         logger.warning(f"Basemap unavailable ({exc}); plotting without it.")
 
@@ -551,6 +563,65 @@ def _coloured_segments(ax, xy, speeds, cmap, norm, linewidth):
     lc.set_capstyle("round")
     ax.add_collection(lc)
     return lc
+
+
+# Printed height of the Figure 5 panels (tikz \panelht = 5.3cm), so
+# that colorbar and scale bar match the circulation figures (Figures 8 and 9):
+# 7 pt bold text, colorbar 1.02 x 0.065 in, both at 8.5 % of the panel height.
+PRINT_PANEL_HEIGHT_IN = 5.3 / 2.54
+PRINT_FONT_PT = 7.0
+BAR_Y_FRAC = 0.085
+PRINT_LINE_PT = 0.45   # track line width in print
+
+
+def _print_scale(fig, ax):
+    """Figure inches per printed inch for this panel, and its size."""
+    ax.apply_aspect()
+    pos = ax.get_position()
+    w_in = pos.width * fig.get_figwidth()
+    h_in = pos.height * fig.get_figheight()
+    return h_in / PRINT_PANEL_HEIGHT_IN, w_in, h_in
+
+
+def _inset_speed_colorbar(fig, ax, cmap, norm):
+    """Horizontal speed colorbar in the lower right, laid out as in the
+    circulation figures: bold label above, bold tick labels below."""
+    k, w_in, h_in = _print_scale(fig, ax)
+    fw, fh = 1.02 * k / w_in, 0.065 * k / h_in
+    fs = PRINT_FONT_PT * k
+    cax = ax.inset_axes([0.95 - fw, BAR_Y_FRAC, fw, fh])
+    cax.set_zorder(210)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cb = fig.colorbar(sm, cax=cax, orientation="horizontal", extend="max")
+    vmax = norm.vmax
+    step = 0.1 if vmax > 0.15 else 0.05 if vmax > 0.06 else 0.02
+    ticks = np.arange(0.0, vmax + 1e-9, step)
+    cb.set_ticks(ticks)
+    cb.ax.set_xticklabels([f"{t:g}" for t in ticks], fontsize=fs,
+                          fontweight="bold")
+    cb.set_label(SPEED_LABEL, fontsize=fs, fontweight="bold", labelpad=1.5 * k)
+    cb.ax.xaxis.set_label_position("top")
+    cb.ax.tick_params(length=1.5 * k, width=0.6 * k, pad=1 * k)
+    cb.ax.minorticks_off()
+    cb.outline.set_linewidth(0.6 * k)
+    return cb
+
+
+def _print_scale_bar(fig, ax, length_m=1000.0, label="1 km"):
+    """Scale bar in the lower left as in the circulation figures: white bar
+    with black edge, 0 and the length below its ends."""
+    k, _, h_in = _print_scale(fig, ax)
+    x0, x1 = ax.get_xlim()
+    y0, y1 = sorted(ax.get_ylim())
+    bx = x0 + 0.04 * (x1 - x0)
+    by = y0 + BAR_Y_FRAC * (y1 - y0)
+    height = 0.065 * k / h_in * (y1 - y0)
+    ax.add_patch(Rectangle((bx, by), length_m, height, facecolor="white",
+                           edgecolor="black", linewidth=0.6 * k, zorder=150))
+    for x, text in ((bx, "0"), (bx + length_m, label)):
+        ax.text(x, by - 0.015 * (y1 - y0), text, ha="center", va="top",
+                fontsize=PRINT_FONT_PT * k, fontweight="bold", zorder=151)
 
 
 def _prepare_background(image_path, fade=0.5, fade_to="white", saturation=0.0):
@@ -623,12 +694,13 @@ def plot_tracks_pixel(tracks, image_path, out_path, linewidth=1.0, alpha=0.8):
 
 def plot_track_map_velocity(tracks_utm, out_path, frame_interval_min=2.0,
                             cmap="plasma", basemap=True, utm_epsg=UTM_EPSG,
-                            linewidth=1.0, vmin=None, vmax=None,
+                            linewidth=None, vmin=None, vmax=None,
                             colorbar=True, scalebar_length_m=1000.0,
                             scalebar_label="1 km", dpi=300):
-    """UTM trajectory map with each segment coloured by drift speed."""
+    """UTM trajectory map with each segment coloured by drift speed (m/s)."""
     setup_publication_style()
     _, all_speeds = compute_track_speeds(tracks_utm, frame_interval_min)
+    all_speeds = all_speeds * M_PER_MIN_TO_M_PER_S
     norm = _speed_norm(all_speeds, vmin=vmin, vmax=vmax)
     cmap_obj = plt.get_cmap(cmap)
 
@@ -642,37 +714,41 @@ def plot_track_map_velocity(tracks_utm, out_path, frame_interval_min=2.0,
         xy = arr[order, 1:3]
         if len(xy) < 2:
             continue
-        speeds = segment_speeds(frames, xy, frame_interval_min)
-        _coloured_segments(ax, xy, speeds, cmap_obj, norm, linewidth)
+        speeds = segment_speeds(frames, xy, frame_interval_min) * M_PER_MIN_TO_M_PER_S
+        _coloured_segments(ax, xy, speeds, cmap_obj, norm, linewidth or 1.0)
         n_tracks += 1
 
     ax.autoscale()  # LineCollections do not autoscale the view
+    if colorbar:
+        # Room below the tracks for the scale bar and colorbar
+        y0, y1 = ax.get_ylim()
+        ax.set_ylim(y0 - 0.04 * (y1 - y0), y1)
     if basemap:
         add_basemap(ax, utm_epsg=utm_epsg)
     ax.set_xticks([])
     ax.set_yticks([])
     if scalebar_length_m and scalebar_length_m > 0:
-        draw_km_scale_bar(ax, length_m=scalebar_length_m,
-                          label=scalebar_label)
+        _print_scale_bar(fig, ax, length_m=scalebar_length_m,
+                         label=scalebar_label)
 
+    if linewidth is None:
+        lw = PRINT_LINE_PT * _print_scale(fig, ax)[0]
+        for coll in ax.collections:
+            coll.set_linewidth(lw)
     if colorbar:
-        sm = plt.cm.ScalarMappable(cmap=cmap_obj, norm=norm)
-        sm.set_array([])
-        cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04, extend="max")
-        cbar.set_label(SPEED_LABEL, fontsize=AXIS_LABEL_SIZE,
-                       fontweight="bold")
+        _inset_speed_colorbar(fig, ax, cmap_obj, norm)
     _save_figure(fig, out_path, dpi=dpi)
     logger.info(f"Wrote {out_path} ({n_tracks} trajectories)")
 
 
 def plot_tracks_pixel_velocity(tracks, tracks_utm, image_path, out_path,
                                frame_interval_min=2.0, cmap="plasma",
-                               linewidth=1.0, image_fade=0.5,
+                               linewidth=None, image_fade=0.5,
                                image_fade_to="white", image_saturation=0.0,
                                vmin=None, vmax=None, colorbar=True, dpi=300):
     """Image-space trajectories coloured by the GEOREFERENCED drift speed.
 
-    Each pixel segment reuses its UTM segment's m/min speed (matched per
+    Each pixel segment reuses its UTM segment's speed in m/s (matched per
     iceberg by starting frame), so the colours mean the same physical speed
     as the UTM figure. No scale bar: the oblique view has no single
     pixel-to-metre ratio. The background frame is muted for legibility.
@@ -685,6 +761,7 @@ def plot_tracks_pixel_velocity(tracks, tracks_utm, image_path, out_path,
 
     speeds_by_id, all_speeds = compute_track_speeds(tracks_utm,
                                                     frame_interval_min)
+    all_speeds = all_speeds * M_PER_MIN_TO_M_PER_S
     norm = _speed_norm(all_speeds, vmin=vmin, vmax=vmax)
     cmap_obj = plt.get_cmap(cmap)
 
@@ -702,8 +779,9 @@ def plot_tracks_pixel_velocity(tracks, tracks_utm, image_path, out_path,
             continue
         seg_map = speeds_by_id.get(int(berg), {})
         speeds = np.array([seg_map.get(int(frames[i]), np.nan)
-                           for i in range(len(frames) - 1)], dtype=float)
-        _coloured_segments(ax, uv, speeds, cmap_obj, norm, linewidth)
+                           for i in range(len(frames) - 1)],
+                          dtype=float) * M_PER_MIN_TO_M_PER_S
+        _coloured_segments(ax, uv, speeds, cmap_obj, norm, linewidth or 1.0)
         n_tracks += 1
 
     ax.set_xlim(0, image.shape[1])
@@ -711,12 +789,12 @@ def plot_tracks_pixel_velocity(tracks, tracks_utm, image_path, out_path,
     ax.set_xticks([])
     ax.set_yticks([])
 
+    if linewidth is None:
+        lw = PRINT_LINE_PT * _print_scale(fig, ax)[0]
+        for coll in ax.collections:
+            coll.set_linewidth(lw)
     if colorbar:
-        sm = plt.cm.ScalarMappable(cmap=cmap_obj, norm=norm)
-        sm.set_array([])
-        cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04, extend="max")
-        cbar.set_label(SPEED_LABEL, fontsize=AXIS_LABEL_SIZE,
-                       fontweight="bold")
+        _inset_speed_colorbar(fig, ax, cmap_obj, norm)
     _save_figure(fig, out_path, dpi=dpi)
     logger.info(f"Wrote {out_path} ({n_tracks} trajectories)")
 
@@ -753,32 +831,45 @@ def save_speed_legend(out_path, vmin, vmax, cmap="plasma",
 
 def render_track_figures(config, tracks, assembled, paths, out_dir):
     """All trajectory figures for one georeferenced sequence, on one shared
-    drift-speed colour scale (0 to a rounded robust 98th percentile)."""
+    drift-speed colour scale in m/s (0 to the robust 98th percentile, rounded
+    up to 0.05 m/s). Both velocity figures carry their own colorbar."""
     setup_publication_style()
     out_dir = Path(out_dir)
 
+    # Leave out tracks with an implausibly fast single step (figures only)
+    max_step = getattr(config, "figure_max_step_speed", None)
+    if max_step:
+        speeds_by_id, _ = compute_track_speeds(assembled, config.frame_interval_min)
+        drop = {b for b, seg in speeds_by_id.items()
+                if seg and np.nanmax(list(seg.values())) * M_PER_MIN_TO_M_PER_S > max_step}
+        assembled = {b: xy for b, xy in assembled.items() if b not in drop}
+        keep = ~np.isin(tracks["id"], list(drop))
+        tracks = {k: v[keep] for k, v in tracks.items()}
+        logger.info(f"Figures: left out {len(drop)} tracks with a step faster "
+                    f"than {max_step} m/s; {len(assembled)} remain")
+
     _, all_speeds = compute_track_speeds(assembled, config.frame_interval_min)
-    finite = all_speeds[np.isfinite(all_speeds)]
+    finite = all_speeds[np.isfinite(all_speeds)] * M_PER_MIN_TO_M_PER_S
     vmin = 0.0
-    vmax = round(float(np.percentile(finite, 98.0)), 1) if finite.size else 1.0
+    vmax = (float(np.ceil(np.percentile(finite, 98.0) / 0.05) * 0.05)
+            if finite.size else 0.1)
     if vmax <= vmin:
         vmax = vmin + 1e-6
-    logger.info(f"Shared drift-speed colour scale: {vmin:.2f}-{vmax:.2f} m/min")
+    logger.info(f"Shared drift-speed colour scale: {vmin:.2f}-{vmax:.2f} m/s")
 
     plot_track_map(assembled, out_dir / "tracks_map.png",
                    basemap=config.basemap)
     plot_track_map_velocity(assembled, out_dir / "tracks_map_velocity.png",
                             frame_interval_min=config.frame_interval_min,
                             basemap=config.basemap, vmin=vmin, vmax=vmax,
-                            colorbar=False)
+                            colorbar=True)
 
     background = first_image(paths["images"])
     plot_tracks_pixel(tracks, background, out_dir / "tracks_pixel.png")
     plot_tracks_pixel_velocity(tracks, assembled, background,
                                out_dir / "tracks_pixel_velocity.png",
                                frame_interval_min=config.frame_interval_min,
-                               vmin=vmin, vmax=vmax, colorbar=False)
-    save_speed_legend(out_dir / "speed_legend.png", vmin=vmin, vmax=vmax)
+                               vmin=vmin, vmax=vmax, colorbar=True)
 
 
 # ============================================================================

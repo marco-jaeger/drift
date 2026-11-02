@@ -19,6 +19,7 @@ from typing import Optional
 import numpy as np
 
 from helpers import (
+    build_frame_to_image,
     get_glimpse, get_sequences, load_mot_tracks, log_config, log_section,
     save_config_snapshot,
 )
@@ -48,6 +49,8 @@ class GeoreferenceConfig:
 
     # Sea surface and timing
     z_sea_mean: float = 42.0          # Camera/DEM vertical datum [m]
+    tide_file: Optional[str] = None   # CSV time,sea_level_m (relative to the
+                                      # mean) in data/<dataset>/; None = flat
     frame_interval_min: float = 2.0   # Minutes between consecutive frames
 
     # Track filtering (same fields as CirculationConfig)
@@ -59,6 +62,9 @@ class GeoreferenceConfig:
     # Figures (rendered by visualize.py)
     make_figures: bool = True
     basemap: bool = True
+    figure_max_step_speed: Optional[float] = 0.5  # m/s; tracks with a faster
+                                       # single step are left out of the figures
+                                       # (likely identity or outline errors)
 
 
 # ============================================================================
@@ -151,8 +157,62 @@ def bounding_box_points(tracks):
 
 
 def sea_level_for_frames(frames, z_sea_mean=42.0):
-    """Constant sea-surface height per detection (flat-sea model)."""
-    return np.full(np.asarray(frames).shape, float(z_sea_mean))
+    """Sea-surface height per detection.
+
+    z_sea_mean is either a scalar (flat sea at constant height) or an array
+    already aligned with `frames` (e.g. from tide_sea_level).
+    """
+    frames = np.asarray(frames)
+    z = np.asarray(z_sea_mean, dtype=float)
+    if z.ndim == 0:
+        return np.full(frames.shape, float(z))
+    if z.shape != frames.shape:
+        raise ValueError(f"sea level array {z.shape} does not match frames "
+                         f"{frames.shape}")
+    return z
+
+
+def frame_times(image_dir, frames):
+    """Capture time (EXIF DateTime, camera clock) of each frame number."""
+    from datetime import datetime
+    from PIL import Image
+    frame_to_image = build_frame_to_image(image_dir)
+    times = {}
+    for f in np.unique(frames):
+        name = frame_to_image.get(int(f))
+        if name is None:
+            raise ValueError(f"No image for frame {f} in {image_dir}")
+        exif = Image.open(image_dir / name).getexif()
+        stamp = exif.get_ifd(0x8769).get(36867) or exif.get(306)
+        if not stamp:
+            raise ValueError(f"No EXIF capture time in {name}")
+        times[int(f)] = np.datetime64(datetime.strptime(stamp, "%Y:%m:%d %H:%M:%S"))
+    return np.array([times[int(f)] for f in frames])
+
+
+def tide_sea_level(tracks, image_dir, tide_csv, z_sea_mean=42.0):
+    """Per-detection sea-surface height: z_sea_mean plus the tidal sea level
+    at the capture time of its image, linearly interpolated from tide_csv
+    (columns time, sea_level_m; same clock as the camera)."""
+    import pandas as pd
+    tide = pd.read_csv(tide_csv, parse_dates=["time"])
+    t_tide = tide["time"].values.astype("datetime64[s]").astype(np.int64)
+    t_img = frame_times(image_dir, tracks["frame"]).astype("datetime64[s]").astype(np.int64)
+    if t_img.min() < t_tide.min() or t_img.max() > t_tide.max():
+        raise ValueError("Image times fall outside the tide record")
+    return z_sea_mean + np.interp(t_img, t_tide, tide["sea_level_m"].values)
+
+
+def sea_level(config, tracks, paths):
+    """Scalar z_sea_mean, or per-detection heights when config.tide_file is set."""
+    if not getattr(config, "tide_file", None):
+        return config.z_sea_mean
+    tide_csv = paths["images"].parent / config.tide_file
+    z = tide_sea_level(tracks, paths["images"], tide_csv, config.z_sea_mean)
+    logger.info(f"Tide-corrected sea surface from {tide_csv}: "
+                f"{z.min() - config.z_sea_mean:+.2f} to "
+                f"{z.max() - config.z_sea_mean:+.2f} m around {config.z_sea_mean} m")
+    return z
 
 
 def project_detections(camera, tracks, z_sea_mean=42.0, point="waterline",
@@ -308,10 +368,11 @@ def run_georeference(config: GeoreferenceConfig):
             logger.warning(f"No outlines at {paths['outlines']} "
                            f"(run extract-outlines); falling back to bbox tracer")
 
+        z_sea = sea_level(config, tracks, paths)
         if use_outlines:
-            wl = load_waterlines(paths, tracks, camera, config.z_sea_mean,
+            wl = load_waterlines(paths, tracks, camera, z_sea,
                                  config.vertical_threshold_deg)
-            detections = project_detections(camera, tracks, config.z_sea_mean,
+            detections = project_detections(camera, tracks, z_sea,
                                             centers=wl.centers)
             finite = np.isfinite(detections[:, 2:4]).all(axis=1)
             if not finite.all():
@@ -323,7 +384,7 @@ def run_georeference(config: GeoreferenceConfig):
                 outlines.write_iceberg_sizes_csv(
                     sizes, out_dir / "iceberg_sizes.csv")
         else:
-            detections = project_detections(camera, tracks, config.z_sea_mean)
+            detections = project_detections(camera, tracks, z_sea)
 
         assembled = assemble_tracks(detections,
                                     out_csv=out_dir / "tracks_utm.csv")

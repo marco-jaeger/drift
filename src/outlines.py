@@ -410,7 +410,10 @@ def _waterlines_fast(tracks, camera, outlines, z_sea, vertical_threshold_deg):
                 or _near_vertical_at(nxy, a, b, i_max, vertical_threshold_deg)):
             flagged[idx_present[j]] = True
 
-    xy = project_to_sea(camera, ep_uv, z_sea)
+    z_arr = np.asarray(z_sea, dtype=float)
+    if z_arr.ndim:  # per-detection heights -> two endpoints per outline
+        z_arr = np.repeat(z_arr[np.asarray(idx_present)], 2)
+    xy = project_to_sea(camera, ep_uv, z_arr)
     fin = np.isfinite(xy).all(axis=1)
     left, right = xy[0::2], xy[1::2]
     finite_pair = fin[0::2] & fin[1::2] & valid

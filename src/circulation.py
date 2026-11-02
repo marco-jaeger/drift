@@ -37,7 +37,8 @@ from helpers import (
 )
 from georeference import (
     UTM_EPSG, assemble_tracks, bounding_box_points, load_camera,
-    load_waterlines, project_detections, project_to_sea, sea_level_for_frames,
+    load_waterlines, project_detections, project_to_sea, sea_level,
+    sea_level_for_frames,
     window_tracks,
 )
 import outlines
@@ -62,6 +63,9 @@ class CirculationConfig:
 
     # Sea surface and temporal sampling
     z_sea_mean: float = 42.0
+    tide_file: Optional[str] = None   # CSV time,sea_level_m in data/<dataset>/
+    out_name: Optional[str] = None    # Write to circulation/<out_name>/ so
+                                      # variants do not overwrite each other
     frame_interval_min: float = 2.0
     max_gap_frames: int = 3           # Drop segments spanning larger gaps
 
@@ -79,14 +83,21 @@ class CirculationConfig:
     y_min: Optional[float] = None
     y_max: Optional[float] = None
     grid_resolution_m: float = 100.0
-    smoothing_sigma: float = 1.25
-    max_distance_from_data_m: float = 100.0  # No extrapolation beyond this
+    smoothing_sigma: float = 1.5
+    max_distance_from_data_m: float = 100.0  # interpolate only: no
+                                             # extrapolation beyond this
+    # 'median': median of the velocity samples per grid cell, cells with
+    # fewer than min_samples_per_cell samples are left empty, then NaN-aware
+    # Gaussian smoothing; 'interpolate': linear interpolation of all samples
+    # onto the grid, then smoothing (previous behaviour)
+    aggregation: str = "median"
+    min_samples_per_cell: int = 10
 
-    # Size split: None -> one combined field; 'p50'/'p25'/... percentile of
+    # Size split: None -> one combined field; 'p50'/'p75'/... percentile of
     # segment widths, or '12m'/'16m' fixed width in metres.
-    size_split: Optional[str] = None
+    size_split: Optional[str] = "p75"
     size_basis: str = "per-iceberg"   # or 'per-detection'
-    min_samples_per_iceberg: int = 5  # Trusted widths needed for a median
+    min_samples_per_iceberg: int = 25  # Trusted widths needed for a median
 
     # Rendering
     vmax_percentile: float = 98.0     # Robust shared colour-scale maximum
@@ -103,14 +114,15 @@ class CirculationConfig:
 # PER-DETECTION SIZE (bbox fallback) AND SPLIT PARSING
 # ============================================================================
 
-def per_detection_widths(config, tracks, camera):
+def per_detection_widths(config, tracks, camera, z_sea_mean=None):
     """Bbox fallback width [m]: distance between the projected lower corners.
 
     Systematically biased (the lowest pixel row rarely coincides with the
     widest columns); prefer the outline-based metric when outlines exist.
     """
     _, bottom_left, bottom_right = bounding_box_points(tracks)
-    z_sea = sea_level_for_frames(tracks["frame"], config.z_sea_mean)
+    z_sea = sea_level_for_frames(
+        tracks["frame"], config.z_sea_mean if z_sea_mean is None else z_sea_mean)
     bl_world = project_to_sea(camera, bottom_left, z_sea)
     br_world = project_to_sea(camera, bottom_right, z_sea)
     return np.linalg.norm(br_world - bl_world, axis=1)
@@ -254,16 +266,69 @@ def nan_gaussian_filter(field, sigma):
     return out
 
 
-def grid_velocity_field(config, X, Y, points, vectors):
-    """Interpolate scattered velocities onto the grid, smooth, and mask cells
-    farther than max_distance_from_data_m from any observation.
+def cell_counts_and_medians(X, Y, points, vectors):
+    """Number of samples and median velocity per grid cell.
+
+    Grid nodes (X, Y) are cell centres; a sample belongs to the cell whose
+    centre is nearest along each axis.
 
     Returns:
-        (U, V, speed) with invalid cells NaN.
+        (count, U_med, V_med) on the grid; cells without samples are NaN.
+    """
+    xs, ys = X[0, :], Y[:, 0]
+    res_x = xs[1] - xs[0] if len(xs) > 1 else 1.0
+    res_y = ys[1] - ys[0] if len(ys) > 1 else 1.0
+    col = np.rint((points[:, 0] - xs[0]) / res_x).astype(int)
+    row = np.rint((points[:, 1] - ys[0]) / res_y).astype(int)
+    inside = (col >= 0) & (col < len(xs)) & (row >= 0) & (row < len(ys))
+    count = np.zeros(X.shape)
+    U = np.full(X.shape, np.nan)
+    V = np.full(X.shape, np.nan)
+    if not inside.any():
+        return count, U, V
+    flat = row[inside] * len(xs) + col[inside]
+    order = np.argsort(flat, kind="stable")
+    flat_sorted = flat[order]
+    u = vectors[inside, 0][order]
+    v = vectors[inside, 1][order]
+    cells, starts, n = np.unique(flat_sorted, return_index=True, return_counts=True)
+    for c, a, k in zip(cells, starts, n):
+        r, q = divmod(int(c), len(xs))
+        count[r, q] = k
+        U[r, q] = np.median(u[a:a + k])
+        V[r, q] = np.median(v[a:a + k])
+    return count, U, V
+
+
+def grid_velocity_field(config, X, Y, points, vectors):
+    """Aggregate scattered velocities onto the grid and smooth.
+
+    aggregation='median': per-cell median of the samples, cells with fewer
+    than min_samples_per_cell samples left empty, NaN-aware Gaussian
+    smoothing, and the result kept only in cells that hold enough samples.
+    aggregation='interpolate': linear interpolation, smoothing, and masking
+    of cells farther than max_distance_from_data_m from any sample.
+
+    Returns:
+        (U, V, speed, count) with invalid cells NaN; count is the number of
+        samples per cell.
     """
     if len(points) == 0:
         empty = np.full(X.shape, np.nan)
-        return empty, empty.copy(), empty.copy()
+        return empty, empty.copy(), empty.copy(), np.zeros(X.shape)
+
+    count, U_med, V_med = cell_counts_and_medians(X, Y, points, vectors)
+    if config.aggregation == "median":
+        enough = count >= config.min_samples_per_cell
+        U = nan_gaussian_filter(np.where(enough, U_med, np.nan),
+                                config.smoothing_sigma)
+        V = nan_gaussian_filter(np.where(enough, V_med, np.nan),
+                                config.smoothing_sigma)
+        U = np.where(enough, U, np.nan)
+        V = np.where(enough, V, np.nan)
+        return U, V, np.sqrt(U ** 2 + V ** 2), count
+    if config.aggregation != "interpolate":
+        raise ValueError(f"Unknown aggregation '{config.aggregation}'")
 
     U = griddata(points, vectors[:, 0], (X, Y), method="linear")
     V = griddata(points, vectors[:, 1], (X, Y), method="linear")
@@ -277,7 +342,7 @@ def grid_velocity_field(config, X, Y, points, vectors):
     valid = near_data & np.isfinite(U) & np.isfinite(V)
     U = np.where(valid, U, np.nan)
     V = np.where(valid, V, np.nan)
-    return U, V, np.sqrt(U ** 2 + V ** 2)
+    return U, V, np.sqrt(U ** 2 + V ** 2), count
 
 
 def extend_field_for_streamlines(U, V, iterations=1):
@@ -332,6 +397,7 @@ def _run_sequence(config, paths, output_dir):
         raise RuntimeError("No detections in the selected window.")
 
     camera = load_camera(paths["camera"])
+    z_sea = sea_level(config, tracks, paths)
     use_outlines = config.use_outlines and paths["outlines"].exists()
     if config.use_outlines and not use_outlines:
         logger.warning(f"No outlines at {paths['outlines']} "
@@ -341,21 +407,21 @@ def _run_sequence(config, paths, output_dir):
     waterline_arrays = None
     if use_outlines:
         waterline_arrays = load_waterlines(paths, tracks, camera,
-                                           config.z_sea_mean,
+                                           z_sea,
                                            config.vertical_threshold_deg)
-        detections = project_detections(camera, tracks, config.z_sea_mean,
+        detections = project_detections(camera, tracks, z_sea,
                                         centers=waterline_arrays.centers)
         # Full flow coverage: where the outline centre did not project (e.g.
         # near-horizon endpoint), fall back to the bbox tracer; the width
         # stays NaN so those bergs remain unclassified but not dropped.
         nan_pos = ~np.isfinite(detections[:, 2:4]).all(axis=1)
         if nan_pos.any():
-            bbox_det = project_detections(camera, tracks, config.z_sea_mean)
+            bbox_det = project_detections(camera, tracks, z_sea)
             detections[nan_pos, 2:4] = bbox_det[nan_pos, 2:4]
             logger.info(f"Filled {int(nan_pos.sum())} detections with the "
                         f"bbox tracer where the outline centre did not project")
     else:
-        detections = project_detections(camera, tracks, config.z_sea_mean)
+        detections = project_detections(camera, tracks, z_sea)
 
     assembled = assemble_tracks(detections)
     logger.info(f"Projected {len(detections)} detections into "
@@ -387,7 +453,7 @@ def _run_sequence(config, paths, output_dir):
             width_metric = ("georeferenced apparent waterline width (m), "
                             "outline-based (trusted outlines only)")
         else:
-            widths = per_detection_widths(config, tracks, camera)
+            widths = per_detection_widths(config, tracks, camera, z_sea)
             width_metric = ("georeferenced apparent waterline width (m), "
                             "bounding-box lower-corner distance")
 
@@ -465,8 +531,9 @@ def _run_sequence(config, paths, output_dir):
     # --- Grid, render --- #
     fields = {}
     for label, points, vectors in class_segments:
-        U, V, speed = grid_velocity_field(config, X, Y, points, vectors)
-        fields[label] = dict(points=points, U=U, V=V, speed=speed)
+        U, V, speed, count = grid_velocity_field(config, X, Y, points, vectors)
+        fields[label] = dict(points=points, vectors=vectors, U=U, V=V,
+                             speed=speed, count=count)
         logger.info(f"{label} class: {len(points)} velocity segments")
 
     vmax = _resolve_vmax(config, [f["speed"] for f in fields.values()])
@@ -484,6 +551,14 @@ def _run_sequence(config, paths, output_dir):
                                 bounds, stream_path)
         outputs[f"vectors_{label}"] = str(vec_path)
         outputs[f"streamlines_{label}"] = str(stream_path)
+
+    # Gridded fields and samples for custom figures (density maps, panels)
+    arrays = {"X": X, "Y": Y, "detections": detections}
+    for label, f in fields.items():
+        for key in ("U", "V", "speed", "count", "points", "vectors"):
+            arrays[f"{label}_{key}"] = f[key]
+    np.savez_compressed(output_dir / "circulation_fields.npz", **arrays)
+    outputs["fields"] = str(output_dir / "circulation_fields.npz")
 
     legend_path = output_dir / "circulation_legend.png"
     save_speed_legend(legend_path, vmin=0, vmax=vmax)
@@ -507,7 +582,14 @@ def _run_sequence(config, paths, output_dir):
                         "y_min": bounds[2], "y_max": bounds[3]},
         "grid_resolution_m": config.grid_resolution_m,
         "smoothing_sigma": config.smoothing_sigma,
-        "sea_surface": f"constant mean sea level (z = {config.z_sea_mean} m)",
+        "aggregation": config.aggregation,
+        "min_samples_per_cell": config.min_samples_per_cell,
+        "n_cells_with_enough_samples": {
+            label: int((f["count"] >= config.min_samples_per_cell).sum())
+            for label, f in fields.items()},
+        "sea_surface": (f"tide-corrected ({config.tide_file}) around z = "
+                        f"{config.z_sea_mean} m" if config.tide_file else
+                        f"constant mean sea level (z = {config.z_sea_mean} m)"),
         "vmax_m_per_min": vmax,
         "config": asdict(config),
     }
@@ -604,6 +686,8 @@ def run_circulation(config: CirculationConfig):
             logger.warning(f"No track.txt found for {sequence_name}, skipping")
             continue
         log_section(f"Circulation analysis: {sequence_name}")
+        if config.out_name:
+            paths = dict(paths, circulation=paths["circulation"] / config.out_name)
         if config.window_hours is not None:
             _run_windowed(config, paths)
         else:
